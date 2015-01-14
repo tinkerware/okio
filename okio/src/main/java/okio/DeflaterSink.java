@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.util.zip.Deflater;
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
+import static okio.SegmentPools.commonPool;
 import static okio.Util.checkOffsetAndCount;
 
 /**
@@ -73,7 +74,7 @@ public final class DeflaterSink implements Sink {
       head.pos += toDeflate;
       if (head.pos == head.limit) {
         source.head = head.pop();
-        SegmentPool.INSTANCE.recycle(head);
+        commonPool().recycle(head);
       }
 
       byteCount -= toDeflate;
