@@ -25,6 +25,8 @@ import java.util.Random;
 import org.junit.Test;
 
 import static java.util.Arrays.asList;
+
+import static okio.SegmentPools.commonPool;
 import static okio.TestUtil.repeat;
 import static okio.Util.UTF_8;
 import static org.junit.Assert.assertEquals;
@@ -118,23 +120,23 @@ public final class BufferTest {
     // Take 2 * MAX_SIZE segments. This will drain the pool, even if other tests filled it.
     buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
     buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
-    assertEquals(0, SegmentPool.INSTANCE.byteCount);
+    assertEquals(0, commonPool().byteCount);
 
     // Recycle MAX_SIZE segments. They're all in the pool.
     buffer.readByteString(SegmentPool.MAX_SIZE);
-    assertEquals(SegmentPool.MAX_SIZE, SegmentPool.INSTANCE.byteCount);
+    assertEquals(SegmentPool.MAX_SIZE, commonPool().byteCount);
 
     // Recycle MAX_SIZE more segments. The pool is full so they get garbage collected.
     buffer.readByteString(SegmentPool.MAX_SIZE);
-    assertEquals(SegmentPool.MAX_SIZE, SegmentPool.INSTANCE.byteCount);
+    assertEquals(SegmentPool.MAX_SIZE, commonPool().byteCount);
 
     // Take MAX_SIZE segments to drain the pool.
     buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
-    assertEquals(0, SegmentPool.INSTANCE.byteCount);
+    assertEquals(0, commonPool().byteCount);
 
     // Take MAX_SIZE more segments. The pool is drained so these will need to be allocated.
     buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
-    assertEquals(0, SegmentPool.INSTANCE.byteCount);
+    assertEquals(0, commonPool().byteCount);
   }
 
   @Test public void moveBytesBetweenBuffersShareSegment() throws Exception {

@@ -15,6 +15,8 @@
  */
 package okio;
 
+import static okio.SegmentPools.commonPool;
+
 /**
  * A segment of a buffer.
  *
@@ -86,7 +88,7 @@ final class Segment {
     // Which side of the split is larger? We want to copy as few bytes as possible.
     if (aSize < bSize) {
       // Create a segment of size 'aSize' before this segment.
-      Segment before = SegmentPool.INSTANCE.take();
+      Segment before = commonPool().take();
       System.arraycopy(data, pos, before.data, before.pos, aSize);
       pos += aSize;
       before.limit += aSize;
@@ -94,7 +96,7 @@ final class Segment {
       return before;
     } else {
       // Create a new segment of size 'bSize' after this segment.
-      Segment after = SegmentPool.INSTANCE.take();
+      Segment after = commonPool().take();
       System.arraycopy(data, pos + aSize, after.data, after.pos, bSize);
       limit -= bSize;
       after.limit += bSize;
@@ -112,7 +114,7 @@ final class Segment {
     if ((prev.limit - prev.pos) + (limit - pos) > SIZE) return; // Cannot compact.
     writeTo(prev, limit - pos);
     pop();
-    SegmentPool.INSTANCE.recycle(this);
+    commonPool().recycle(this);
   }
 
   /** Moves {@code byteCount} bytes from this segment to {@code sink}. */
