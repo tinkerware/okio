@@ -10,7 +10,7 @@ final class SegmentPools {
   /**
    * Returns a shared buffer pool most suitable for use in this runtime.
    */
-  static SegmentPool commonPool() {
-    return SegmentPool.INSTANCE;
+  static LinkedSegmentPool commonPool() {
+    return LinkedSegmentPool.INSTANCE;
   }
 }
