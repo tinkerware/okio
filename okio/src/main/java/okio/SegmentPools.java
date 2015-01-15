@@ -23,11 +23,17 @@ final class SegmentPools {
 
     int cpuCount = Runtime.getRuntime().availableProcessors();
     long maxHeap = Runtime.getRuntime().maxMemory();
-    boolean concurrentOverride = Boolean.getBoolean("okio.pool.concurrent");
 
-    boolean concurrentEnv = concurrentOverride ||
-                            cpuCount >= cpuCountThreshold ||
-                            maxHeap >= heapSizeThreshold;
+    boolean concurrentOverride = false, overridePresent = false;
+    String overrideValue = System.getProperty("okio.pool.concurrent");
+    if (overrideValue != null) {
+      overridePresent = true;
+      concurrentOverride = Boolean.valueOf(overrideValue);
+    }
+
+    boolean concurrentEnv = overridePresent ?
+                            concurrentOverride :
+                            (cpuCount >= cpuCountThreshold || maxHeap >= heapSizeThreshold);
 
     bestPool = concurrentEnv ? concurrentPool() : linkedPool();
   }

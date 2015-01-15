@@ -2,7 +2,6 @@ package okio;
 
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * A segment pool that performs well when buffer take and recycle operations are concurrent.
@@ -12,27 +11,34 @@ class ConcurrentSegmentPool implements SegmentPool {
 
   private final Queue<Segment> free = new ConcurrentLinkedQueue<>();
 
-  private final AtomicLong byteCount = new AtomicLong();
+  private final PoolMetrics.Recorder recorder = new PoolMetrics.Recorder();
 
   @Override public Segment take() {
     Segment segment = free.poll();
     if (segment == null) {
       segment = new Segment();
+      recorder.recordSegmentTake(Segment.SIZE, true);
     } else {
-      long bytesInPool = byteCount.addAndGet(-Segment.SIZE);
-      assert bytesInPool >= 0 : "Bytes in pool must be non-negative";
+      recorder.recordSegmentTake(Segment.SIZE, false);
     }
     return segment;
   }
 
   @Override public void recycle(Segment segment) {
     if (segment.next != null || segment.prev != null) throw new IllegalArgumentException();
-    if (byteCount.get() + Segment.SIZE > MAX_SIZE) return;
+    if (recorder.usedByteCount.sum() + Segment.SIZE > MAX_SIZE) {
+      recorder.recordSegmentRecycle(Segment.SIZE, true);
+      return;
+    }
 
-    byteCount.addAndGet(Segment.SIZE);
+    recorder.recordSegmentRecycle(Segment.SIZE, false);
     segment.next = null;
     segment.pos = segment.limit = 0;
 
     free.offer(segment);
+  }
+
+  @Override public PoolMetrics metrics() {
+    return recorder.snapshot();
   }
 }

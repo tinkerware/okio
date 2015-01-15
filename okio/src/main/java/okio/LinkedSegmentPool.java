@@ -25,10 +25,17 @@ final class LinkedSegmentPool implements SegmentPool {
   /** Singly-linked list of segments. */
   private Segment next;
 
-  /** Total bytes in this pool. */
+  /** Recorder for pool metrics. */
+  private final PoolMetrics.Recorder recorder;
+
+  /**
+   * Total bytes in this pool. We still maintain this to provide an exact
+   * limit on pool memory usage.
+   */
   long byteCount;
 
   private LinkedSegmentPool() {
+    recorder = new PoolMetrics.Recorder();
   }
 
   @Override public Segment take() {
@@ -37,21 +44,31 @@ final class LinkedSegmentPool implements SegmentPool {
         Segment result = next;
         next = result.next;
         result.next = null;
-        byteCount -= Segment.SIZE;
+        recorder.recordSegmentTake(Segment.SIZE, false);
         return result;
       }
     }
+    recorder.recordSegmentTake(Segment.SIZE, true);
     return new Segment(); // Pool is empty. Don't zero-fill while holding a lock.
   }
 
   @Override public void recycle(Segment segment) {
     if (segment.next != null || segment.prev != null) throw new IllegalArgumentException();
+
     synchronized (this) {
-      if (byteCount + Segment.SIZE > MAX_SIZE) return; // Pool is full.
+      if (byteCount + Segment.SIZE > MAX_SIZE) {
+        recorder.recordSegmentRecycle(Segment.SIZE, true);
+        return; // Pool is full.
+      }
       byteCount += Segment.SIZE;
       segment.next = next;
       segment.pos = segment.limit = 0;
       next = segment;
     }
+    recorder.recordSegmentRecycle(Segment.SIZE, false);
+  }
+
+  @Override public PoolMetrics metrics() {
+    return recorder.snapshot();
   }
 }
