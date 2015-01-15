@@ -13,4 +13,6 @@ public interface SegmentPool {
   Segment take();
 
   void recycle(Segment segment);
+
+  PoolMetrics metrics();
 }
