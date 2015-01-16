@@ -39,15 +39,20 @@ final class LinkedSegmentPool implements SegmentPool {
   }
 
   @Override public Segment take() {
+    Segment result = null;
     synchronized (this) {
       if (next != null) {
-        Segment result = next;
+        result = next;
         next = result.next;
         result.next = null;
-        recorder.recordSegmentTake(Segment.SIZE, false);
-        return result;
+        byteCount -= Segment.SIZE;
       }
     }
+    if (result != null) {
+      recorder.recordSegmentTake(Segment.SIZE, false);
+      return result;
+    }
+
     recorder.recordSegmentTake(Segment.SIZE, true);
     return new Segment(); // Pool is empty. Don't zero-fill while holding a lock.
   }
