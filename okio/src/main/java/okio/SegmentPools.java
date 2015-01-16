@@ -39,7 +39,7 @@ final class SegmentPools {
   }
 
   /**
-   * Returns a shared buffer pool most suitable for use in this runtime.
+   * Returns a shared segment pool most suitable for use in this runtime.
    */
   static SegmentPool commonPool() {
     return bestPool;
