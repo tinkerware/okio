@@ -1,5 +1,7 @@
 package okio;
 
+import okio.pool.SegmentPool;
+
 /**
  * Provides access to common segment pools.
  */
@@ -7,11 +9,11 @@ final class SegmentPools {
 
   private SegmentPools() { /* not allowed */ }
 
-  static SegmentPool linkedPool() {
+  private static SegmentPool linkedPool() {
     return LinkedSegmentPool.INSTANCE;
   }
 
-  static SegmentPool concurrentPool() {
+  private static SegmentPool concurrentPool() {
     return ConcurrentSegmentPool.INSTANCE;
   }
 

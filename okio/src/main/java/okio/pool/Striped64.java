@@ -6,7 +6,7 @@
  * http://gee.cs.oswego.edu/cgi-bin/viewcvs.cgi/jsr166/src/jsr166e/Striped64.java?revision=1.8&view=markup
  */
 
-package okio;
+package okio.pool;
 
 import java.util.Random;
 

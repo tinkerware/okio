@@ -6,7 +6,7 @@
  * http://gee.cs.oswego.edu/cgi-bin/viewcvs.cgi/jsr166/src/jsr166e/LongAdder.java?revision=1.14&view=markup
  */
 
-package okio;
+package okio.pool;
 
 import java.io.Serializable;
 import java.util.concurrent.atomic.AtomicLong;
