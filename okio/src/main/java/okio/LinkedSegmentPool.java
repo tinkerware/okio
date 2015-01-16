@@ -15,11 +15,13 @@
  */
 package okio;
 
+import okio.pool.PoolMetrics;
+
 /**
  * A collection of unused segments, necessary to avoid GC churn and zero-fill.
  * This pool is a thread-safe static singleton.
  */
-final class LinkedSegmentPool implements SegmentPool {
+final class LinkedSegmentPool implements AllocatingPool {
   static final LinkedSegmentPool INSTANCE = new LinkedSegmentPool();
 
   /** Singly-linked list of segments. */
@@ -30,7 +32,7 @@ final class LinkedSegmentPool implements SegmentPool {
 
   /**
    * Total bytes in this pool. We still maintain this to provide an exact
-   * limit on pool memory usage.
+   * limit on pool memory usage; metrics are too expensive to sum up every time.
    */
   long byteCount;
 
@@ -49,11 +51,11 @@ final class LinkedSegmentPool implements SegmentPool {
       }
     }
     if (result != null) {
-      recorder.recordSegmentTake(Segment.SIZE, false);
+      recorder.recordUse(Segment.SIZE, false);
       return result;
     }
 
-    recorder.recordSegmentTake(Segment.SIZE, true);
+    recorder.recordUse(Segment.SIZE, true);
     return new Segment(); // Pool is empty. Don't zero-fill while holding a lock.
   }
 
@@ -62,7 +64,7 @@ final class LinkedSegmentPool implements SegmentPool {
 
     synchronized (this) {
       if (byteCount + Segment.SIZE > MAX_SIZE) {
-        recorder.recordSegmentRecycle(Segment.SIZE, true);
+        recorder.recordRecycle(Segment.SIZE, true);
         return; // Pool is full.
       }
       byteCount += Segment.SIZE;
@@ -70,7 +72,7 @@ final class LinkedSegmentPool implements SegmentPool {
       segment.pos = segment.limit = 0;
       next = segment;
     }
-    recorder.recordSegmentRecycle(Segment.SIZE, false);
+    recorder.recordRecycle(Segment.SIZE, false);
   }
 
   @Override public PoolMetrics metrics() {

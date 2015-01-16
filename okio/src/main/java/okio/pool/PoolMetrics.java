@@ -1,9 +1,9 @@
-package okio;
+package okio.pool;
 
 /**
  * An immutable snapshot of metrics on segment pool usage.
  */
-class PoolMetrics {
+public class PoolMetrics {
 
   private final long usedByteCount;
   private final long allocatedByteCount;
@@ -27,40 +27,40 @@ class PoolMetrics {
     this.totalRecycleCount = totalRecycleCount;
   }
 
-  long usedByteCount() {
+  public long usedByteCount() {
     return usedByteCount;
   }
 
-  long allocatedByteCount() {
+  public long allocatedByteCount() {
     return allocatedByteCount;
   }
 
-  long outstandingByteCount() {
+  public long outstandingByteCount() {
     return outstandingByteCount;
   }
 
-  long totalAllocationCount() {
+  public long totalAllocationCount() {
     return totalAllocationCount;
   }
 
-  long totalTakeCount() {
+  public long totalTakeCount() {
     return totalTakeCount;
   }
 
-  long totalRecycleCount() {
+  public long totalRecycleCount() {
     return totalRecycleCount;
   }
 
-  static class Recorder {
+  public static class Recorder {
 
-    final LongAdder usedByteCount = new LongAdder();
-    final LongAdder allocatedByteCount = new LongAdder();
-    final LongAdder outstandingByteCount = new LongAdder();
-    final LongAdder totalAllocationCount = new LongAdder();
-    final LongAdder totalTakeCount = new LongAdder();
-    final LongAdder totalRecycleCount = new LongAdder();
+    private final LongAdder usedByteCount = new LongAdder();
+    private final LongAdder allocatedByteCount = new LongAdder();
+    private final LongAdder outstandingByteCount = new LongAdder();
+    private final LongAdder totalAllocationCount = new LongAdder();
+    private final LongAdder totalTakeCount = new LongAdder();
+    private final LongAdder totalRecycleCount = new LongAdder();
 
-    PoolMetrics snapshot() {
+    public PoolMetrics snapshot() {
       return new PoolMetrics(usedByteCount.sum(),
                              allocatedByteCount.sum(),
                              outstandingByteCount.sum(),
@@ -69,27 +69,27 @@ class PoolMetrics {
                              totalRecycleCount.sum());
     }
 
-    void recordSegmentTake(int size, boolean allocated) {
-      checkSize(size);
+    public void recordUse(int segmentSize, boolean allocated) {
+      checkSize(segmentSize);
 
       if (allocated) {
-        allocatedByteCount.add(size);
+        allocatedByteCount.add(segmentSize);
         totalAllocationCount.increment();
       }
       else {
-        usedByteCount.add(-size);
+        usedByteCount.add(-segmentSize);
       }
-      outstandingByteCount.add(size);
+      outstandingByteCount.add(segmentSize);
       totalTakeCount.increment();
     }
 
-    void recordSegmentRecycle(int size, boolean deallocated) {
-      checkSize(size);
+    public void recordRecycle(int segmentSize, boolean deallocated) {
+      checkSize(segmentSize);
 
       if (!deallocated) {
-        usedByteCount.add(size);
+        usedByteCount.add(segmentSize);
       }
-      outstandingByteCount.add(-size);
+      outstandingByteCount.add(-segmentSize);
       totalRecycleCount.increment();
     }
 

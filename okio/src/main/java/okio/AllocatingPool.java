@@ -1,10 +1,11 @@
 package okio;
 
+import okio.pool.SegmentPool;
+
 /**
- * A collection of unused segments, necessary to avoid GC churn and zero-fill.
- * Pool implementations must be thread-safe.
+ * A segment pool that can actually allocate and manage segments.
  */
-public interface SegmentPool {
+interface AllocatingPool extends SegmentPool {
 
   /** The maximum number of bytes to pool. */
   // TODO: Is 64 KiB a good maximum size? Do we ever have that many idle segments?
@@ -14,5 +15,4 @@ public interface SegmentPool {
 
   void recycle(Segment segment);
 
-  PoolMetrics metrics();
 }

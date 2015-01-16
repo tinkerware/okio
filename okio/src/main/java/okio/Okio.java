@@ -30,8 +30,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
-import static okio.SegmentPools.commonPool;
 import static okio.Util.checkOffsetAndCount;
+import static okio.Util.pool;
 
 /** Essential APIs for working with Okio. */
 public final class Okio {
@@ -84,7 +84,7 @@ public final class Okio {
 
           if (head.pos == head.limit) {
             source.head = head.pop();
-            commonPool().recycle(head);
+            pool().recycle(head);
           }
         }
       }

@@ -118,24 +118,24 @@ public final class BufferTest {
     Buffer buffer = new Buffer();
 
     // Take 2 * MAX_SIZE segments. This will drain the pool, even if other tests filled it.
-    buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
-    buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
+    buffer.write(new byte[(int) AllocatingPool.MAX_SIZE]);
+    buffer.write(new byte[(int) AllocatingPool.MAX_SIZE]);
     assertEquals(0, commonPool().metrics().usedByteCount());
 
     // Recycle MAX_SIZE segments. They're all in the pool.
-    buffer.readByteString(SegmentPool.MAX_SIZE);
-    assertEquals(SegmentPool.MAX_SIZE, commonPool().metrics().usedByteCount());
+    buffer.readByteString(AllocatingPool.MAX_SIZE);
+    assertEquals(AllocatingPool.MAX_SIZE, commonPool().metrics().usedByteCount());
 
     // Recycle MAX_SIZE more segments. The pool is full so they get garbage collected.
-    buffer.readByteString(SegmentPool.MAX_SIZE);
-    assertEquals(SegmentPool.MAX_SIZE, commonPool().metrics().usedByteCount());
+    buffer.readByteString(AllocatingPool.MAX_SIZE);
+    assertEquals(AllocatingPool.MAX_SIZE, commonPool().metrics().usedByteCount());
 
     // Take MAX_SIZE segments to drain the pool.
-    buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
+    buffer.write(new byte[(int) AllocatingPool.MAX_SIZE]);
     assertEquals(0, commonPool().metrics().usedByteCount());
 
     // Take MAX_SIZE more segments. The pool is drained so these will need to be allocated.
-    buffer.write(new byte[(int) SegmentPool.MAX_SIZE]);
+    buffer.write(new byte[(int) AllocatingPool.MAX_SIZE]);
     assertEquals(0, commonPool().metrics().usedByteCount());
   }
 
