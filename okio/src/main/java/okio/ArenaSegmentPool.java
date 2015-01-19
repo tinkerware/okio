@@ -5,11 +5,14 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
+
 import okio.pool.PoolMetrics;
 
 /**
  * A segment pool that allocates segments from thread-local arenas.
  */
+@IgnoreJRERequirement
 class ArenaSegmentPool implements AllocatingPool {
 
   static final ArenaSegmentPool INSTANCE = new ArenaSegmentPool();
@@ -31,6 +34,11 @@ class ArenaSegmentPool implements AllocatingPool {
      */
     private final AtomicLong byteCount = new AtomicLong();
 
+    @IgnoreJRERequirement
+    Arena() {
+      // constructor exists as target for the ignore JDK annotation only
+    }
+
     /**
      * Reserves a free segment or allocates a new segment. An arena first
      * checks its own pool, then randomly picks another arena and steals
@@ -39,6 +47,7 @@ class ArenaSegmentPool implements AllocatingPool {
      * it delegates to {@linkplain #stealOrAllocate()} to steal from a sibling
      * or allocate a fresh segment.
      */
+    @IgnoreJRERequirement
     Segment take() {
       Segment segment = pool.pollFirst();
       if (segment != null) {
@@ -62,6 +71,7 @@ class ArenaSegmentPool implements AllocatingPool {
      * The recycled segment is pushed on the front of the queue in order to avoid
      * contending with siblings stealing and recycling surplus segments.
      */
+    @IgnoreJRERequirement
     void recycleLocal(Segment segment) {
       if (byteCount.get() >= AllocatingPool.MAX_SIZE) {
         // TODO: This is a good place to notify a periodic reaper.
@@ -79,6 +89,7 @@ class ArenaSegmentPool implements AllocatingPool {
      * Takes a segment from the tail. If the pool is empty or this arena is closed,
      * returns null. Called from a sibling's thread.
      */
+    @IgnoreJRERequirement
     private Segment steal() {
       return recordReusedSegment(pool.pollLast());
     }
@@ -94,6 +105,7 @@ class ArenaSegmentPool implements AllocatingPool {
       return segment;
     }
 
+    @IgnoreJRERequirement
     private Arena randomArena() {
       int index = ThreadLocalRandom.current().nextInt(allArenas.size());
       Arena result;
