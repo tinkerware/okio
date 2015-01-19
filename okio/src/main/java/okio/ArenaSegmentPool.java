@@ -121,9 +121,10 @@ class ArenaSegmentPool implements AllocatingPool {
     }
 
     @Override public String toString() {
-      return String.format("Arena[tid=%s, identity=%s]",
+      return String.format("Arena[tid=%s, identity=%s, size=%,3d]",
                            Long.toHexString(Thread.currentThread().getId()),
-                           super.toString());
+                           super.toString(),
+                           byteCount.get());
     }
   }
 
