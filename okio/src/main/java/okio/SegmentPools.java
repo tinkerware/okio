@@ -14,7 +14,7 @@ final class SegmentPools {
   }
 
   private static SegmentPool concurrentPool() {
-    return ConcurrentSegmentPool.INSTANCE;
+    return ArenaSegmentPool.INSTANCE;
   }
 
   private static final SegmentPool bestPool;
