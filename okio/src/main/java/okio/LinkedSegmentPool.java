@@ -60,7 +60,7 @@ final class LinkedSegmentPool implements AllocatingPool {
   }
 
   @Override public void recycle(Segment segment) {
-    if (segment.next != null || segment.prev != null) throw new IllegalArgumentException();
+    segment.reset();
 
     synchronized (this) {
       if (byteCount + Segment.SIZE > MAX_SIZE) {
@@ -69,7 +69,6 @@ final class LinkedSegmentPool implements AllocatingPool {
       }
       byteCount += Segment.SIZE;
       segment.next = next;
-      segment.pos = segment.limit = 0;
       next = segment;
     }
     recorder.recordRecycle(Segment.SIZE, false);

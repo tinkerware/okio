@@ -219,10 +219,7 @@ class ArenaSegmentPool implements AllocatingPool {
   }
 
   @Override public void recycle(Segment segment) {
-    if (segment.next != null || segment.prev != null) throw new IllegalArgumentException();
-    segment.next = null;
-    segment.pos = segment.limit = 0;
-
+    segment.reset();
     arena.get().recycleLocal(segment);
   }
 

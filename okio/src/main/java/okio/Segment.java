@@ -117,6 +117,16 @@ final class Segment {
     pool().recycle(this);
   }
 
+  /**
+   * Resets {@code pos} and {@code limit} to 0. Call this from a pool when
+   * recycling the segment. Throws {@code IllegalArgumentException} if
+   * {@code next} or {@code prev} is not {@code null}.
+   */
+  public void reset() {
+    if (next != null || prev != null) throw new IllegalArgumentException();
+    pos = limit = 0;
+  }
+
   /** Moves {@code byteCount} bytes from this segment to {@code sink}. */
   // TODO: if sink has fewer bytes than this, it may be cheaper to reverse the
   //       direction of the copy and swap the segments!
