@@ -31,10 +31,10 @@ class ArenaSegmentPool implements AllocatingPool {
 
   static final int ARENA_CLEAN_PERIOD_MILLIS = 30 * 1000;
 
-  private static final ScheduledExecutorService workers;
+  private static final ScheduledExecutorService scheduler;
 
   static {
-    workers = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+    scheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
       final AtomicInteger id = new AtomicInteger();
       @Override public Thread newThread(Runnable r) {
         Thread thread = new Thread(String.format("Okio Arena Cleaner - " + id.incrementAndGet()));
@@ -85,7 +85,7 @@ class ArenaSegmentPool implements AllocatingPool {
     }
 
     private Segment stealOrAllocate() {
-      Segment result = randomArena().steal();
+      Segment result = randomArena().stealSegment(this);
       if (result == null) {
         result = new Segment();
         recorder.recordUse(Segment.SIZE, true);
@@ -178,9 +178,9 @@ class ArenaSegmentPool implements AllocatingPool {
       super(referent);
     }
 
-    Segment steal() {
+    Segment stealSegment(Arena thief) {
       Arena arena = get();
-      return arena != null ? arena.steal() : null;
+      return arena != null && arena != thief ? arena.steal() : null;
     }
 
   }
@@ -208,7 +208,7 @@ class ArenaSegmentPool implements AllocatingPool {
   private final PoolMetrics.Recorder recorder = new PoolMetrics.Recorder();
 
   private ArenaSegmentPool() {
-    workers.scheduleWithFixedDelay(new CleanTask(),
+    scheduler.scheduleWithFixedDelay(new CleanTask(),
                                    ARENA_CLEAN_PERIOD_MILLIS,
                                    ARENA_CLEAN_PERIOD_MILLIS,
                                    TimeUnit.MILLISECONDS);
