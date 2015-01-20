@@ -93,6 +93,11 @@ public class PoolMetrics {
       totalRecycleCount.increment();
     }
 
+    public void recordShrink(int segmentSize) {
+      checkSize(segmentSize);
+      usedByteCount.add(-segmentSize);
+    }
+
     private void checkSize(int size) {
       if (size < 0) throw new IllegalArgumentException("size < 0");
     }

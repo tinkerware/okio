@@ -1,8 +1,16 @@
 package okio;
 
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
@@ -16,6 +24,25 @@ import okio.pool.PoolMetrics;
 class ArenaSegmentPool implements AllocatingPool {
 
   static final ArenaSegmentPool INSTANCE = new ArenaSegmentPool();
+
+  static final long ARENA_SIZE_HIGHMARK = AllocatingPool.MAX_SIZE;
+
+  static final long ARENA_SIZE_LOWMARK = ARENA_SIZE_HIGHMARK / 2;
+
+  static final int ARENA_CLEAN_PERIOD_MILLIS = 30 * 1000;
+
+  private static final ScheduledExecutorService workers;
+
+  static {
+    workers = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+      final AtomicInteger id = new AtomicInteger();
+      @Override public Thread newThread(Runnable r) {
+        Thread thread = new Thread(String.format("Okio Arena Cleaner - " + id.incrementAndGet()));
+        thread.setDaemon(true);
+        return thread;
+      }
+    });
+  }
 
   /**
    * A separate region of memory used to allocate and recycle segments. An arena
@@ -73,10 +100,7 @@ class ArenaSegmentPool implements AllocatingPool {
      */
     @IgnoreJRERequirement
     void recycleLocal(Segment segment) {
-      if (byteCount.get() >= AllocatingPool.MAX_SIZE) {
-        // TODO: This is a good place to notify a periodic reaper.
-        // That would prevent wastage from a large number of threads
-        // each holding on to maximum allowed number of segments.
+      if (byteCount.get() >= ARENA_SIZE_HIGHMARK) {
         recorder.recordRecycle(Segment.SIZE, true);
         return;
       }
@@ -106,9 +130,9 @@ class ArenaSegmentPool implements AllocatingPool {
     }
 
     @IgnoreJRERequirement
-    private Arena randomArena() {
+    private ArenaRef randomArena() {
       int index = ThreadLocalRandom.current().nextInt(allArenas.size());
-      Arena result;
+      ArenaRef result;
       try {
         result = allArenas.get(index);
       }
@@ -118,6 +142,17 @@ class ArenaSegmentPool implements AllocatingPool {
         result = allArenas.get(0);
       }
       return result;
+    }
+
+    private void maybeShrink(long lowMark, long highMark) {
+      long currentSize = byteCount.get();
+      if (currentSize >= highMark) {
+        // Let's shrink the pool until size is smaller than the low mark.
+        while (byteCount.getAndAdd(-Segment.SIZE) >= lowMark) {
+          pool.pollLast();
+          recorder.recordShrink(Segment.SIZE);
+        }
+      }
     }
 
     @Override public String toString() {
@@ -131,19 +166,53 @@ class ArenaSegmentPool implements AllocatingPool {
   private final ThreadLocal<Arena> arena = new ThreadLocal<Arena>() {
     @Override protected Arena initialValue() {
       Arena arena = new Arena();
-      allArenas.add(arena);
+      allArenas.add(new ArenaRef(arena));
       return arena;
     }
 
-    @Override public void remove() {
-      allArenas.remove(get());
-      super.remove();
-    }
   };
 
-  private final CopyOnWriteArrayList<Arena> allArenas = new CopyOnWriteArrayList<>();
+  private class ArenaRef extends WeakReference<Arena> {
+
+    public ArenaRef(Arena referent) {
+      super(referent);
+    }
+
+    Segment steal() {
+      Arena arena = get();
+      return arena != null ? arena.steal() : null;
+    }
+
+  }
+
+  private class CleanTask implements Runnable {
+
+    @Override public void run() {
+      Collection<ArenaRef> refsToRemove = new ArrayList<>();
+      for (ArenaRef arenaRef : allArenas) {
+        Arena arena = arenaRef.get();
+        if (arena == null) {
+          refsToRemove.add(arenaRef);
+        } else {
+          arena.maybeShrink(ARENA_SIZE_LOWMARK, ARENA_SIZE_HIGHMARK);
+        }
+      }
+      if (!refsToRemove.isEmpty()) {
+        allArenas.removeAll(refsToRemove);
+      }
+    }
+  }
+
+  private final CopyOnWriteArrayList<ArenaRef> allArenas = new CopyOnWriteArrayList<>();
 
   private final PoolMetrics.Recorder recorder = new PoolMetrics.Recorder();
+
+  private ArenaSegmentPool() {
+    workers.scheduleWithFixedDelay(new CleanTask(),
+                                   ARENA_CLEAN_PERIOD_MILLIS,
+                                   ARENA_CLEAN_PERIOD_MILLIS,
+                                   TimeUnit.MILLISECONDS);
+  }
 
   @Override public Segment take() {
     return arena.get().take();
