@@ -22,8 +22,6 @@ import okio.pool.PoolMetrics;
  * This pool is a thread-safe static singleton.
  */
 final class LinkedSegmentPool implements AllocatingPool {
-  static final LinkedSegmentPool INSTANCE = new LinkedSegmentPool();
-
   /** Singly-linked list of segments. */
   private Segment next;
 
@@ -36,7 +34,7 @@ final class LinkedSegmentPool implements AllocatingPool {
    */
   long byteCount;
 
-  private LinkedSegmentPool() {
+  LinkedSegmentPool() {
     recorder = new PoolMetrics.Recorder();
   }
 

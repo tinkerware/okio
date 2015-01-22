@@ -20,7 +20,7 @@ import java.util.zip.Deflater;
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
 import static okio.Util.checkOffsetAndCount;
-import static okio.Util.pool;
+import static okio.Util.currentPool;
 
 /**
  * A sink that uses <a href="http://tools.ietf.org/html/rfc1951">DEFLATE</a> to
@@ -74,7 +74,7 @@ public final class DeflaterSink implements Sink {
       head.pos += toDeflate;
       if (head.pos == head.limit) {
         source.head = head.pop();
-        pool().recycle(head);
+        currentPool().recycle(head);
       }
 
       byteCount -= toDeflate;

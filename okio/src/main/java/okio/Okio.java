@@ -31,7 +31,7 @@ import java.util.logging.Logger;
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
 import static okio.Util.checkOffsetAndCount;
-import static okio.Util.pool;
+import static okio.Util.currentPool;
 
 /** Essential APIs for working with Okio. */
 public final class Okio {
@@ -84,7 +84,7 @@ public final class Okio {
 
           if (head.pos == head.limit) {
             source.head = head.pop();
-            pool().recycle(head);
+            currentPool().recycle(head);
           }
         }
       }

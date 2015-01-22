@@ -7,6 +7,7 @@ import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -23,13 +24,11 @@ import okio.pool.PoolMetrics;
 @IgnoreJRERequirement
 class ArenaSegmentPool implements AllocatingPool {
 
-  static final ArenaSegmentPool INSTANCE = new ArenaSegmentPool();
-
   static final long ARENA_SIZE_HIGHMARK = AllocatingPool.MAX_SIZE;
 
   static final long ARENA_SIZE_LOWMARK = ARENA_SIZE_HIGHMARK / 2;
 
-  static final int ARENA_CLEAN_PERIOD_MILLIS = 30 * 1000;
+  static final int ARENA_CLEAN_PERIOD_MILLIS = 5 * 1000;
 
   private static final ScheduledExecutorService scheduler;
 
@@ -37,11 +36,21 @@ class ArenaSegmentPool implements AllocatingPool {
     scheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
       final AtomicInteger id = new AtomicInteger();
       @Override public Thread newThread(Runnable r) {
-        Thread thread = new Thread(String.format("Okio Arena Cleaner - " + id.incrementAndGet()));
+        Thread thread = new Thread(r, "Okio Arena Cleaner - " + id.incrementAndGet());
         thread.setDaemon(true);
         return thread;
       }
     });
+  }
+
+  private static boolean checkRuntime() {
+    try {
+      Class.forName("java.util.concurrent.ConcurrentLinkedDeque");
+      return true;
+    }
+    catch (ClassNotFoundException e) {
+      return false;
+    }
   }
 
   /**
@@ -49,7 +58,8 @@ class ArenaSegmentPool implements AllocatingPool {
    * is implicitly tied to a single thread, known as its local thread. Arena's
    * associated with other threads are siblings.
    */
-  private class Arena {
+  @IgnoreJRERequirement
+  class Arena {
     /**
      * The pool is only modified at the head by the arena's thread. Other arenas
      * may steal free segments from the tail.
@@ -61,7 +71,6 @@ class ArenaSegmentPool implements AllocatingPool {
      */
     private final AtomicLong byteCount = new AtomicLong();
 
-    @IgnoreJRERequirement
     Arena() {
       // constructor exists as target for the ignore JDK annotation only
     }
@@ -74,7 +83,6 @@ class ArenaSegmentPool implements AllocatingPool {
      * it delegates to {@linkplain #stealOrAllocate()} to steal from a sibling
      * or allocate a fresh segment.
      */
-    @IgnoreJRERequirement
     Segment take() {
       Segment segment = pool.pollFirst();
       if (segment != null) {
@@ -98,7 +106,6 @@ class ArenaSegmentPool implements AllocatingPool {
      * The recycled segment is pushed on the front of the queue in order to avoid
      * contending with siblings stealing and recycling surplus segments.
      */
-    @IgnoreJRERequirement
     void recycleLocal(Segment segment) {
       if (byteCount.get() >= ARENA_SIZE_HIGHMARK) {
         recorder.recordRecycle(Segment.SIZE, true);
@@ -109,11 +116,14 @@ class ArenaSegmentPool implements AllocatingPool {
       recorder.recordRecycle(Segment.SIZE, false);
     }
 
+    int segmentCount() {
+      return pool.size();
+    }
+
     /**
      * Takes a segment from the tail. If the pool is empty or this arena is closed,
      * returns null. Called from a sibling's thread.
      */
-    @IgnoreJRERequirement
     private Segment steal() {
       return recordReusedSegment(pool.pollLast());
     }
@@ -129,7 +139,6 @@ class ArenaSegmentPool implements AllocatingPool {
       return segment;
     }
 
-    @IgnoreJRERequirement
     private ArenaRef randomArena() {
       int index = ThreadLocalRandom.current().nextInt(allArenas.size());
       ArenaRef result;
@@ -144,13 +153,13 @@ class ArenaSegmentPool implements AllocatingPool {
       return result;
     }
 
-    private void maybeShrink(long lowMark, long highMark) {
+    private void maybeTrim(long lowMark, long highMark) {
       long currentSize = byteCount.get();
       if (currentSize >= highMark) {
         // Let's shrink the pool until size is smaller than the low mark.
         while (byteCount.getAndAdd(-Segment.SIZE) >= lowMark) {
           pool.pollLast();
-          recorder.recordShrink(Segment.SIZE);
+          recorder.recordTrim(Segment.SIZE);
         }
       }
     }
@@ -163,16 +172,7 @@ class ArenaSegmentPool implements AllocatingPool {
     }
   }
 
-  private final ThreadLocal<Arena> arena = new ThreadLocal<Arena>() {
-    @Override protected Arena initialValue() {
-      Arena arena = new Arena();
-      allArenas.add(new ArenaRef(arena));
-      return arena;
-    }
-
-  };
-
-  private class ArenaRef extends WeakReference<Arena> {
+  private static class ArenaRef extends WeakReference<Arena> {
 
     public ArenaRef(Arena referent) {
       super(referent);
@@ -185,7 +185,7 @@ class ArenaSegmentPool implements AllocatingPool {
 
   }
 
-  private class CleanTask implements Runnable {
+  class CleanTask implements Runnable {
 
     @Override public void run() {
       Collection<ArenaRef> refsToRemove = new ArrayList<>();
@@ -194,24 +194,57 @@ class ArenaSegmentPool implements AllocatingPool {
         if (arena == null) {
           refsToRemove.add(arenaRef);
         } else {
-          arena.maybeShrink(ARENA_SIZE_LOWMARK, ARENA_SIZE_HIGHMARK);
+          arena.maybeTrim(ARENA_SIZE_LOWMARK, ARENA_SIZE_HIGHMARK);
         }
       }
       if (!refsToRemove.isEmpty()) {
         allArenas.removeAll(refsToRemove);
       }
     }
+
+    public ScheduledFuture<?> schedule() {
+      return scheduler.scheduleWithFixedDelay(this,
+                                              ARENA_CLEAN_PERIOD_MILLIS,
+                                              ARENA_CLEAN_PERIOD_MILLIS,
+                                              TimeUnit.MILLISECONDS);
+    }
+
   }
+
+  // Visible for testing.
+  final ThreadLocal<Arena> arena = new ThreadLocal<Arena>() {
+    @Override protected Arena initialValue() {
+      Arena arena = createArena();
+      allArenas.add(new ArenaRef(arena));
+      return arena;
+    }
+
+  };
 
   private final CopyOnWriteArrayList<ArenaRef> allArenas = new CopyOnWriteArrayList<>();
 
   private final PoolMetrics.Recorder recorder = new PoolMetrics.Recorder();
 
-  private ArenaSegmentPool() {
-    scheduler.scheduleWithFixedDelay(new CleanTask(),
-                                   ARENA_CLEAN_PERIOD_MILLIS,
-                                   ARENA_CLEAN_PERIOD_MILLIS,
-                                   TimeUnit.MILLISECONDS);
+  // Visible for testing.
+  ArenaSegmentPool() {
+    if (!checkRuntime()) {
+      throw new UnsupportedOperationException("ArenaSegmentPool requires Java 7");
+    }
+    createCleanTask().schedule();
+  }
+
+  // Visible for testing.
+  CleanTask createCleanTask() {
+    return new CleanTask();
+  }
+
+  //Visible for testing.
+  Arena createArena() {
+    return new Arena();
+  }
+
+  int arenaCount() {
+    return allArenas.size();
   }
 
   @Override public Segment take() {
