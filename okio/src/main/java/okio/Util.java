@@ -21,11 +21,17 @@ final class Util {
   /** A cheap and type-safe constant for the UTF-8 Charset. */
   public static final Charset UTF_8 = Charset.forName("UTF-8");
 
-  private Util() {
+  private static AllocatingPool pool = (AllocatingPool) SegmentPools.commonPool();
+
+  private Util() { /* not allowed */ }
+
+  // Visible for testing.
+  static void installPool(AllocatingPool newPool) {
+    pool = newPool;
   }
 
-  static AllocatingPool pool() {
-    return (AllocatingPool) SegmentPools.commonPool();
+  static AllocatingPool currentPool() {
+    return pool;
   }
 
   public static void checkOffsetAndCount(long size, long offset, long byteCount) {

@@ -27,7 +27,7 @@ import java.util.Collections;
 import java.util.List;
 
 import static okio.Util.checkOffsetAndCount;
-import static okio.Util.pool;
+import static okio.Util.currentPool;
 import static okio.Util.reverseBytesLong;
 
 /**
@@ -181,7 +181,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
       // If necessary, append another target segment.
       if (target.limit == Segment.SIZE) {
-        target = target.push(pool().take());
+        target = target.push(currentPool().take());
       }
 
       // Copy bytes from the source segment to the target segment.
@@ -219,7 +219,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
       if (s.pos == s.limit) {
         Segment toRecycle = s;
         head = s = toRecycle.pop();
-        pool().recycle(toRecycle);
+        currentPool().recycle(toRecycle);
       }
     }
 
@@ -286,7 +286,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
     if (pos == limit) {
       head = segment.pop();
-      pool().recycle(segment);
+      currentPool().recycle(segment);
     } else {
       segment.pos = pos;
     }
@@ -325,7 +325,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
     if (pos == limit) {
       head = segment.pop();
-      pool().recycle(segment);
+      currentPool().recycle(segment);
     } else {
       segment.pos = pos;
     }
@@ -357,7 +357,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
     if (pos == limit) {
       head = segment.pop();
-      pool().recycle(segment);
+      currentPool().recycle(segment);
     } else {
       segment.pos = pos;
     }
@@ -391,7 +391,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
     if (pos == limit) {
       head = segment.pop();
-      pool().recycle(segment);
+      currentPool().recycle(segment);
     } else {
       segment.pos = pos;
     }
@@ -589,7 +589,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
     if (s.pos == s.limit) {
       head = s.pop();
-      pool().recycle(s);
+      currentPool().recycle(s);
     }
 
     return result;
@@ -676,7 +676,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
 
     if (s.pos == s.limit) {
       head = s.pop();
-      pool().recycle(s);
+      currentPool().recycle(s);
     }
 
     return toCopy;
@@ -707,7 +707,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
       if (head.pos == head.limit) {
         Segment toRecycle = head;
         head = toRecycle.pop();
-        pool().recycle(toRecycle);
+        currentPool().recycle(toRecycle);
       }
     }
   }
@@ -976,13 +976,13 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     if (minimumCapacity < 1 || minimumCapacity > Segment.SIZE) throw new IllegalArgumentException();
 
     if (head == null) {
-      head = pool().take(); // Acquire a first segment.
+      head = currentPool().take(); // Acquire a first segment.
       return head.next = head.prev = head;
     }
 
     Segment tail = head.prev;
     if (tail.limit + minimumCapacity > Segment.SIZE) {
-      tail = tail.push(pool().take()); // Append a new empty segment to fill up.
+      tail = tail.push(currentPool().take()); // Append a new empty segment to fill up.
     }
     return tail;
   }

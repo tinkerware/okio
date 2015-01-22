@@ -93,7 +93,7 @@ public class PoolMetrics {
       totalRecycleCount.increment();
     }
 
-    public void recordShrink(int segmentSize) {
+    public void recordTrim(int segmentSize) {
       checkSize(segmentSize);
       usedByteCount.add(-segmentSize);
     }
