@@ -5,14 +5,18 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
@@ -23,6 +27,7 @@ import okio.pool.PoolMetrics;
  */
 @IgnoreJRERequirement
 class ArenaSegmentPool implements AllocatingPool {
+  private static final Logger logger = Logger.getLogger(ArenaSegmentPool.class.getName());
 
   static final long ARENA_SIZE_HIGHMARK = AllocatingPool.MAX_SIZE;
 
@@ -33,14 +38,22 @@ class ArenaSegmentPool implements AllocatingPool {
   private static final ScheduledExecutorService scheduler;
 
   static {
-    scheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+    ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
       final AtomicInteger id = new AtomicInteger();
+
       @Override public Thread newThread(Runnable r) {
-        Thread thread = new Thread(r, "Okio Arena Cleaner - " + id.incrementAndGet());
+        Thread thread = new Thread(r, "Okio Pool Worker - " + id.incrementAndGet());
         thread.setDaemon(true);
         return thread;
       }
     });
+
+    // We make sure the scheduler can be shutdown during finalization.
+    executor.setRemoveOnCancelPolicy(true);
+    executor.setKeepAliveTime(ARENA_CLEAN_PERIOD_MILLIS * 2, TimeUnit.MILLISECONDS);
+    executor.allowCoreThreadTimeOut(true);
+
+    scheduler = Executors.unconfigurableScheduledExecutorService(executor);
   }
 
   private static boolean checkRuntime() {
@@ -172,6 +185,10 @@ class ArenaSegmentPool implements AllocatingPool {
     }
   }
 
+  /**
+   * A weak reference to an arena so that the pool can avoid holding on to
+   * arenas whose threads are dead.
+   */
   private static class ArenaRef extends WeakReference<Arena> {
 
     public ArenaRef(Arena referent) {
@@ -188,18 +205,7 @@ class ArenaSegmentPool implements AllocatingPool {
   class CleanTask implements Runnable {
 
     @Override public void run() {
-      Collection<ArenaRef> refsToRemove = new ArrayList<>();
-      for (ArenaRef arenaRef : allArenas) {
-        Arena arena = arenaRef.get();
-        if (arena == null) {
-          refsToRemove.add(arenaRef);
-        } else {
-          arena.maybeTrim(ARENA_SIZE_LOWMARK, ARENA_SIZE_HIGHMARK);
-        }
-      }
-      if (!refsToRemove.isEmpty()) {
-        allArenas.removeAll(refsToRemove);
-      }
+      cleanArenas(ARENA_SIZE_LOWMARK, ARENA_SIZE_HIGHMARK);
     }
 
     public ScheduledFuture<?> schedule() {
@@ -209,6 +215,21 @@ class ArenaSegmentPool implements AllocatingPool {
                                               TimeUnit.MILLISECONDS);
     }
 
+  }
+
+  private void cleanArenas(long lowmark, long highmark) {
+    Collection<ArenaRef> refsToRemove = new ArrayList<>();
+    for (ArenaRef arenaRef : allArenas) {
+      Arena arena = arenaRef.get();
+      if (arena == null) {
+        refsToRemove.add(arenaRef);
+      } else {
+        arena.maybeTrim(lowmark, highmark);
+      }
+    }
+    if (!refsToRemove.isEmpty()) {
+      allArenas.removeAll(refsToRemove);
+    }
   }
 
   // Visible for testing.
@@ -221,16 +242,20 @@ class ArenaSegmentPool implements AllocatingPool {
 
   };
 
+  private final ScheduledFuture<?> taskHandle;
+
   private final CopyOnWriteArrayList<ArenaRef> allArenas = new CopyOnWriteArrayList<>();
 
   private final PoolMetrics.Recorder recorder = new PoolMetrics.Recorder();
+
+  private volatile boolean running = true;
 
   // Visible for testing.
   ArenaSegmentPool() {
     if (!checkRuntime()) {
       throw new UnsupportedOperationException("ArenaSegmentPool requires Java 7");
     }
-    createCleanTask().schedule();
+    this.taskHandle = createCleanTask().schedule();
   }
 
   // Visible for testing.
@@ -248,15 +273,53 @@ class ArenaSegmentPool implements AllocatingPool {
   }
 
   @Override public Segment take() {
+    checkState();
     return arena.get().take();
   }
 
   @Override public void recycle(Segment segment) {
+    checkState();
     segment.reset();
     arena.get().recycleLocal(segment);
   }
 
   @Override public PoolMetrics metrics() {
     return recorder.snapshot();
+  }
+
+  @Override public void shutdown() {
+    running = false;
+
+    if (taskHandle != null && !taskHandle.isCancelled()) {
+      if (taskHandle.isDone()) {
+        // Cleaner task had failed and we are now noticing.
+        Throwable thrown = null;
+        try {
+          taskHandle.get();
+        }
+        catch (InterruptedException e) {
+          throw new AssertionError("Pool worker is done", e);
+        }
+        catch (ExecutionException e) {
+          thrown = e;
+        }
+        logger.log(Level.WARNING,
+                   "Found previous pool worker failure; continuing pool shut down",
+                   thrown);
+      } else {
+        taskHandle.cancel(false);
+      }
+
+      // Release all segments for GC and remove stale arena references.
+      cleanArenas(0, 0);
+
+      if (!allArenas.isEmpty()) {
+        logger.warning("Threads that used Okio must die before this pool is reclaimed by GC.");
+      }
+    }
+  }
+
+  private void checkState() {
+    if (!running) throw new IllegalStateException("!running");
   }
 }
