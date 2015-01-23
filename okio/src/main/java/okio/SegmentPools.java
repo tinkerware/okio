@@ -26,7 +26,10 @@ public class SegmentPools {
       return (SegmentPool) create(Class.forName("okio.LinkedSegmentPool"));
     }
     catch (Exception e) {
-      throw new AssertionError("LinkedSegmentPool can not be instantiated", e);
+      AssertionError error =
+          new AssertionError("LinkedSegmentPool can not be instantiated");
+      error.initCause(e);
+      throw error;
     }
   }
 
