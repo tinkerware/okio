@@ -44,11 +44,11 @@ final class LinkedSegmentPool implements AllocatingPool {
       if (next != null) {
         result = next;
         next = result.next;
-        result.next = null;
         byteCount -= Segment.SIZE;
       }
     }
     if (result != null) {
+      result.next = null;
       recorder.recordUse(Segment.SIZE, false);
       return result;
     }
@@ -74,5 +74,19 @@ final class LinkedSegmentPool implements AllocatingPool {
 
   @Override public PoolMetrics metrics() {
     return recorder.snapshot();
+  }
+
+  @Override public void shutdown() {
+    Segment head;
+    synchronized (this) {
+      head = next;
+      next = null;
+      byteCount = 0;
+    }
+
+    while (head != null) {
+      recorder.recordTrim(Segment.SIZE);
+      head = head.next;
+    }
   }
 }

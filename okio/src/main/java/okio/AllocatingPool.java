@@ -15,4 +15,5 @@ interface AllocatingPool extends SegmentPool {
 
   void recycle(Segment segment);
 
+  void shutdown();
 }
