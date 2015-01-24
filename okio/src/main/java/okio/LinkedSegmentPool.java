@@ -44,15 +44,12 @@ final class LinkedSegmentPool implements AllocatingPool {
       if (next != null) {
         result = next;
         next = result.next;
+        result.next = null;
         byteCount -= Segment.SIZE;
+        recorder.recordUse(Segment.SIZE, false);
+        return result;
       }
     }
-    if (result != null) {
-      result.next = null;
-      recorder.recordUse(Segment.SIZE, false);
-      return result;
-    }
-
     recorder.recordUse(Segment.SIZE, true);
     return new Segment(); // Pool is empty. Don't zero-fill while holding a lock.
   }
