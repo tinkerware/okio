@@ -21,7 +21,11 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Iterator;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -50,7 +54,7 @@ import static java.util.Objects.requireNonNull;
 
 @Fork(1)
 @Warmup(iterations = 10, time = 10)
-@Measurement(iterations = 10, time = 10)
+@Measurement(iterations = 10, time = 30)
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)
@@ -58,6 +62,35 @@ public class BufferPerformanceBench {
 
   public static final File OriginPath =
       new File(System.getProperty("okio.bench.origin.path", "/dev/urandom"));
+
+  public static final int MaxRequests = 1000;
+
+  @Param({ "1000" })
+  int maxThinkMicros = 1000;
+
+  @Param({ "1024" })
+  int maxReadBytes = 1024;
+
+  @Param({ "1024" })
+  int maxWriteBytes = 1024;
+
+  @Param({ "2048" })
+  int requestSize = 2048;
+
+  @Param({ "1" })
+  int responseFactor = 1;
+
+  byte[] requestBytes;
+
+  byte[] responseBytes;
+
+  @Setup(Level.Trial)
+  public void storeRequestResponseData() throws IOException {
+    checkOrigin(OriginPath);
+
+    requestBytes = storeSourceData(new byte[requestSize]);
+    responseBytes = storeSourceData(new byte[requestSize * responseFactor]);
+  }
 
   /* Test Workload
    *
@@ -87,8 +120,13 @@ public class BufferPerformanceBench {
    * benchmarks first to decide if a bottleneck is worth pursuing, then use the hot
    * benchmarks to fine tune optimization efforts.
    *
-   * Benchmark threads do not explicitly communicate between each other (except to sync
-   * iterations as needed by JMH).
+   * The cold benchmark simulates a hot thread that enqueues requests, more than one
+   * cold response threads consuming from the queue and an expiring thread that sweeps
+   * the queue and removes already timed-out requests. This setup properly takes
+   * into account the effects of holding on to the buffer segments during the think
+   * time. Every thread group uses its own request queue so that we can avoid high
+   * contention on the queue with large number of cores; the benchmark should measure
+   * buffer operations rather than request queueing mechanics.
    *
    * We simulate think time for each benchmark thread by parking the thread for a
    * configurable number of microseconds (1000 by default).
@@ -131,72 +169,40 @@ public class BufferPerformanceBench {
     readWriteRecycle(buffers);
   }
 
+  private void readWriteRecycle(HotBuffers buffers) throws IOException {
+    buffers.receive(requestBytes, buffers.process).readAll(NullSink);
+    buffers.transmit(responseBytes, buffers.process).readAll(NullSink);
+  }
+
   @Benchmark
   @GroupThreads(1)
   @Group("cold")
-  public void thinkReadHot(HotBuffers buffers) throws IOException {
-    buffers.receive(requestBytes).readAll(NullSink);
+  public void readRequestHot(RequestBuffers requests) throws IOException {
+    requests.enqueueRequest(requestBytes);
   }
 
   @Benchmark
-  @GroupThreads(3)
+  @GroupThreads(6)
   @Group("cold")
-  public void thinkWriteCold(ColdBuffers buffers) throws IOException {
-    buffers.transmit(responseBytes).readAll(NullSink);
+  public void writeResponseCold(ResponseBuffers responses) throws IOException {
+    responses.processResponse(responseBytes).readAll(NullSink);
   }
 
-  private void readWriteRecycle(HotBuffers buffers) throws IOException {
-    buffers.receive(requestBytes).readAll(NullSink);
-    buffers.transmit(responseBytes).readAll(NullSink);
+  @Benchmark
+  @GroupThreads(1)
+  @Group("cold")
+  @BenchmarkMode(Mode.SampleTime)
+  public void sweepAndExpire(Sweeper sweeper) throws IOException {
+    sweeper.requests.sweepAndExpire();
   }
 
-  @Param({ "1000" })
-  int maxThinkMicros = 1000;
+  static class Request {
+    final Buffer data;
+    final long receivedAt;
 
-  @Param({ "1024" })
-  int maxReadBytes = 1024;
-
-  @Param({ "1024" })
-  int maxWriteBytes = 1024;
-
-  @Param({ "2048" })
-  int requestSize = 2048;
-
-  @Param({ "1" })
-  int responseFactor = 1;
-
-  byte[] requestBytes;
-
-  byte[] responseBytes;
-
-  @Setup(Level.Trial)
-  public void storeRequestResponseData() throws IOException {
-    checkOrigin(OriginPath);
-
-    requestBytes = storeSourceData(new byte[requestSize]);
-    responseBytes = storeSourceData(new byte[requestSize * responseFactor]);
-  }
-
-  private byte[] storeSourceData(byte[] dest) throws IOException {
-    requireNonNull(dest, "dest == null");
-    try (BufferedSource source = Okio.buffer(Okio.source(OriginPath))) {
-      source.readFully(dest);
-    }
-    return dest;
-  }
-
-  private void checkOrigin(File path) throws IOException {
-    requireNonNull(path, "path == null");
-
-    if (!path.canRead()) {
-      throw new IllegalArgumentException("can not access: " + path);
-    }
-
-    try (InputStream in = new FileInputStream(path)) {
-      int available = in.read();
-      if (available < 0) {
-        throw new IllegalArgumentException("can not read: " + path);
-      }
+    Request(Buffer data, long receivedAt) {
+      this.data = data;
+      this.receivedAt = receivedAt;
     }
   }
 
@@ -204,33 +210,135 @@ public class BufferPerformanceBench {
    * The state class hierarchy is larger than it needs to be due to a JMH
    * issue where states inheriting setup methods depending on another state
    * do not get initialized correctly from benchmark methods making use
-   * of groups. To work around, we leave the common setup and teardown code
+   * of groups. To work around, we leave the common setup and tear down code
    * in superclasses and move the setup method depending on the bench state
    * to subclasses. Without the workaround, it would have been enough for
    * `ColdBuffers` to inherit from `HotBuffers`.
    */
 
-  @State(Scope.Thread)
-  public static class ColdBuffers extends BufferSetup {
+  @State(Scope.Group)
+  public static class ResponseBuffers extends BufferSetup {
 
-    @Setup(Level.Trial)
+    private RequestBuffers requests;
+
+    @Setup(Level.Iteration)
+    public void setupBench(RequestBuffers requests) {
+      super.bench = requests.bench;
+      this.requests = requests;
+    }
+
+    private Request nextRequest() {
+      int polls = 0;
+      Request result;
+      while((result = requests.queue.poll()) == null && ++polls < 10) {
+        // We expect to spin rarely, if ever; requests are hot.
+        Thread.yield();
+      }
+      assert result != null;
+      requests.lazyAddAndGet(-1);
+      return result;
+    }
+
+    BufferedSource processResponse(byte[] responseBytes) throws IOException {
+      Request request = nextRequest();
+      request.data.readAll(NullSink);
+      return transmit(responseBytes, new Buffer());
+    }
+
+    @Setup(Level.Invocation)
+    public void think() throws InterruptedException {
+      TimeUnit.MICROSECONDS.sleep(bench.maxThinkMicros);
+    }
+  }
+
+  @State(Scope.Group)
+  public static class RequestBuffers extends BufferSetup {
+    /* A bounded queue for requests */
+    final Queue<Request> queue = new ConcurrentLinkedQueue<>();
+    /* Count of in-flight requests */
+    final AtomicInteger requestCount = new AtomicInteger();
+
+    @Setup(Level.Iteration)
     public void setupBench(BufferPerformanceBench bench) {
       super.bench = bench;
     }
 
-    @Setup(Level.Invocation)
-    public void lag() throws InterruptedException {
-      TimeUnit.MICROSECONDS.sleep(bench.maxThinkMicros);
+    boolean enqueueRequest(byte[] requestBytes) throws IOException {
+      Buffer process = new Buffer();
+
+      int currentCount = requestCount.get();
+      if (currentCount < MaxRequests) {
+        Request request = new Request(receive(requestBytes, process), System.nanoTime());
+
+        queue.add(request);
+        return lazyAddAndGet(1) < MaxRequests;
+      }
+      // If queue is full, we send a quick response that's same size as the request instead.
+      transmit(requestBytes, process).readAll(NullSink);
+      return false;
     }
 
+    void sweepAndExpire() throws IOException {
+      Iterator<Request> index = queue.iterator();
+      int expired = 0;
+      long start = System.nanoTime();
+      while(index.hasNext()) {
+        Request request = index.next();
+        long deadline = request.receivedAt + 2 * TimeUnit.MICROSECONDS.toNanos(bench.maxThinkMicros);
+        if (deadline >= start) {
+          index.remove();
+          expired++;
+        }
+      }
+      requestCount.addAndGet(-expired);
+    }
+
+    /**
+     * We do not need memory effects of CAS for updating request counts;
+     * the queue operations would take care of that if we depended on them
+     * (which we don't).
+     */
+    int lazyAddAndGet(int delta) {
+      for (;;) {
+        int current = requestCount.get();
+        int next = current + delta;
+        if (requestCount.weakCompareAndSet(current, next)) {
+          return next;
+        }
+      }
+    }
+  }
+
+  @State(Scope.Group)
+  public static class Sweeper {
+
+    RequestBuffers requests;
+
+    @Setup(Level.Iteration)
+    public void setupRequests(RequestBuffers requests) {
+      this.requests = requests;
+    }
+
+    @Setup(Level.Invocation)
+    public void sleep() throws InterruptedException {
+      TimeUnit.MILLISECONDS.sleep(20L);
+    }
   }
 
   @State(Scope.Thread)
   public static class HotBuffers extends BufferSetup {
 
+    @SuppressWarnings("resource")
+    final Buffer process = new Buffer();
+
     @Setup(Level.Trial)
     public void setupBench(BufferPerformanceBench bench) {
       super.bench = bench;
+    }
+
+    @TearDown(Level.Iteration)
+    public void dispose() throws IOException {
+      releaseBuffers(process);
     }
 
   }
@@ -239,17 +347,12 @@ public class BufferPerformanceBench {
   public static abstract class BufferSetup extends BufferState {
     BufferPerformanceBench bench;
 
-    public BufferedSource receive(byte[] bytes) throws IOException {
-      return super.receive(bytes, bench.maxReadBytes);
+    public Buffer receive(byte[] bytes, Buffer process) throws IOException {
+      return super.receive(bytes, process, bench.maxReadBytes);
     }
 
-    public BufferedSource transmit(byte[] bytes) throws IOException {
-      return super.transmit(bytes, bench.maxWriteBytes);
-    }
-
-    @TearDown
-    public void dispose() throws IOException {
-      releaseBuffers();
+    public Buffer transmit(byte[] bytes, Buffer process) throws IOException {
+      return super.transmit(bytes, process, bench.maxWriteBytes);
     }
 
   }
@@ -260,13 +363,13 @@ public class BufferPerformanceBench {
     final Buffer received = new Buffer();
     @SuppressWarnings("resource")
     final Buffer sent = new Buffer();
-    @SuppressWarnings("resource")
-    final Buffer process = new Buffer();
 
-    public void releaseBuffers() throws IOException {
+    public void releaseBuffers(Buffer... more) throws IOException {
       received.clear();
       sent.clear();
-      process.clear();
+      for (Buffer buffer : more) {
+        buffer.clear();
+      }
     }
 
     /**
@@ -274,7 +377,7 @@ public class BufferPerformanceBench {
      * Expects receive and process buffers to be empty. Leaves the receive buffer empty and
      * process buffer full.
      */
-    protected Buffer receive(byte[] bytes, int maxChunkSize) throws IOException {
+    protected Buffer receive(byte[] bytes, Buffer process, int maxChunkSize) throws IOException {
       writeChunked(received, bytes, maxChunkSize).readAll(process);
       return process;
     }
@@ -284,12 +387,12 @@ public class BufferPerformanceBench {
      * Expects process and sent buffers to be empty. Leaves the process buffer empty and
      * sent buffer full.
      */
-    protected BufferedSource transmit(byte[] bytes, int maxChunkSize) throws IOException {
+    protected Buffer transmit(byte[] bytes, Buffer process, int maxChunkSize) throws IOException {
       writeChunked(process, bytes, maxChunkSize).readAll(sent);
       return sent;
     }
 
-    private BufferedSource writeChunked(Buffer buffer, byte[] bytes, final int chunkSize) {
+    private Buffer writeChunked(Buffer buffer, byte[] bytes, final int chunkSize) {
       int remaining = bytes.length;
       int offset = 0;
       while (remaining > 0) {
@@ -326,5 +429,28 @@ public class BufferPerformanceBench {
       return "NullSink{}";
     }
   };
+
+  private byte[] storeSourceData(byte[] dest) throws IOException {
+    requireNonNull(dest, "dest == null");
+    try (BufferedSource source = Okio.buffer(Okio.source(OriginPath))) {
+      source.readFully(dest);
+    }
+    return dest;
+  }
+
+  private void checkOrigin(File path) throws IOException {
+    requireNonNull(path, "path == null");
+
+    if (!path.canRead()) {
+      throw new IllegalArgumentException("can not access: " + path);
+    }
+
+    try (InputStream in = new FileInputStream(path)) {
+      int available = in.read();
+      if (available < 0) {
+        throw new IllegalArgumentException("can not read: " + path);
+      }
+    }
+  }
 
 }
