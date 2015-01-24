@@ -177,23 +177,22 @@ public class BufferPerformanceBench {
   @Benchmark
   @GroupThreads(1)
   @Group("cold")
-  public void readRequestHot(RequestBuffers requests) throws IOException {
+  public void readRequestHot(RequestHandler requests) throws IOException {
     requests.enqueueRequest(requestBytes);
   }
 
   @Benchmark
   @GroupThreads(6)
   @Group("cold")
-  public void writeResponseCold(ResponseBuffers responses) throws IOException {
+  public void writeResponseCold(ResponseHandler responses) throws IOException {
     responses.processResponse(responseBytes).readAll(NullSink);
   }
 
   @Benchmark
   @GroupThreads(1)
   @Group("cold")
-  @BenchmarkMode(Mode.SampleTime)
   public void sweepAndExpire(Sweeper sweeper) throws IOException {
-    sweeper.requests.sweepAndExpire();
+    sweeper.sweepAndExpire(2 * maxThinkMicros, TimeUnit.MICROSECONDS);
   }
 
   static class Request {
@@ -216,13 +215,13 @@ public class BufferPerformanceBench {
    * `ColdBuffers` to inherit from `HotBuffers`.
    */
 
-  @State(Scope.Group)
-  public static class ResponseBuffers extends BufferSetup {
+  @State(Scope.Thread)
+  public static class ResponseHandler extends BufferSetup {
 
-    private RequestBuffers requests;
+    private RequestQueue requests;
 
-    @Setup(Level.Iteration)
-    public void setupBench(RequestBuffers requests) {
+    @Setup
+    public void setupBench(RequestQueue requests) {
       super.bench = requests.bench;
       this.requests = requests;
     }
@@ -251,46 +250,61 @@ public class BufferPerformanceBench {
     }
   }
 
-  @State(Scope.Group)
-  public static class RequestBuffers extends BufferSetup {
-    /* A bounded queue for requests */
-    final Queue<Request> queue = new ConcurrentLinkedQueue<>();
-    /* Count of in-flight requests */
-    final AtomicInteger requestCount = new AtomicInteger();
+  @State(Scope.Thread)
+  public static class RequestHandler extends BufferSetup {
 
-    @Setup(Level.Iteration)
-    public void setupBench(BufferPerformanceBench bench) {
-      super.bench = bench;
+    private RequestQueue requests;
+
+    @Setup
+    public void setupQueue(RequestQueue requests) {
+      super.bench = requests.bench;
+      this.requests = requests;
     }
 
     boolean enqueueRequest(byte[] requestBytes) throws IOException {
       Buffer process = new Buffer();
 
-      int currentCount = requestCount.get();
+      int currentCount = requests.count.get();
       if (currentCount < MaxRequests) {
         Request request = new Request(receive(requestBytes, process), System.nanoTime());
 
-        queue.add(request);
-        return lazyAddAndGet(1) < MaxRequests;
+        requests.queue.add(request);
+        return requests.lazyAddAndGet(1) < MaxRequests;
       }
       // If queue is full, we send a quick response that's same size as the request instead.
       transmit(requestBytes, process).readAll(NullSink);
       return false;
     }
+  }
 
-    void sweepAndExpire() throws IOException {
+  @State(Scope.Group)
+  public static class RequestQueue {
+    /* A bounded queue for requests */
+    final Queue<Request> queue = new ConcurrentLinkedQueue<>();
+    /* Count of in-flight requests */
+    final AtomicInteger count = new AtomicInteger();
+    /* Bench parameters*/
+    private BufferPerformanceBench bench;
+
+    @Setup
+    public void setupBench(BufferPerformanceBench bench) {
+      this.bench = bench;
+    }
+
+
+    void sweepAndExpire(long timeOutNanos) throws IOException {
       Iterator<Request> index = queue.iterator();
       int expired = 0;
       long start = System.nanoTime();
       while(index.hasNext()) {
         Request request = index.next();
-        long deadline = request.receivedAt + 2 * TimeUnit.MICROSECONDS.toNanos(bench.maxThinkMicros);
+        long deadline = request.receivedAt + timeOutNanos;
         if (deadline >= start) {
           index.remove();
           expired++;
         }
       }
-      requestCount.addAndGet(-expired);
+      count.addAndGet(-expired);
     }
 
     /**
@@ -300,28 +314,32 @@ public class BufferPerformanceBench {
      */
     int lazyAddAndGet(int delta) {
       for (;;) {
-        int current = requestCount.get();
+        int current = count.get();
         int next = current + delta;
-        if (requestCount.weakCompareAndSet(current, next)) {
+        if (count.weakCompareAndSet(current, next)) {
           return next;
         }
       }
     }
   }
 
-  @State(Scope.Group)
+  @State(Scope.Thread)
   public static class Sweeper {
 
-    RequestBuffers requests;
+    RequestQueue requests;
 
     @Setup(Level.Iteration)
-    public void setupRequests(RequestBuffers requests) {
+    public void setupRequests(RequestQueue requests) {
       this.requests = requests;
+    }
+
+    void sweepAndExpire(long timeOut, TimeUnit unit) throws IOException {
+      requests.sweepAndExpire(unit.toNanos(timeOut));
     }
 
     @Setup(Level.Invocation)
     public void sleep() throws InterruptedException {
-      TimeUnit.MILLISECONDS.sleep(20L);
+      TimeUnit.MILLISECONDS.sleep(50L);
     }
   }
 
@@ -357,7 +375,7 @@ public class BufferPerformanceBench {
 
   }
 
-  public static class BufferState {
+  static abstract class BufferState {
 
     @SuppressWarnings("resource")
     final Buffer received = new Buffer();
@@ -432,6 +450,7 @@ public class BufferPerformanceBench {
 
   private byte[] storeSourceData(byte[] dest) throws IOException {
     requireNonNull(dest, "dest == null");
+
     try (BufferedSource source = Okio.buffer(Okio.source(OriginPath))) {
       source.readFully(dest);
     }

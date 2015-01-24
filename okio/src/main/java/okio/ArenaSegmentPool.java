@@ -116,8 +116,8 @@ class ArenaSegmentPool implements AllocatingPool {
 
     /**
      * Recycles a segment to be free so that it can be reserved again at a later time.
-     * The recycled segment is pushed on the front of the queue in order to avoid
-     * contending with siblings stealing and recycling surplus segments.
+     * The recycled segment is pushed on the front of the queue; we will never contend
+     * with same-thread takes and only rarely have to contend with siblings.
      */
     void recycleLocal(Segment segment) {
       if (byteCount.get() >= ARENA_SIZE_HIGHMARK) {
