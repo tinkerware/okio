@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.openjdk.jmh.annotations.AuxCounters;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -68,17 +69,17 @@ public class BufferPerformanceBench {
   @Param({ "1000" })
   int maxThinkMicros = 1000;
 
-  @Param({ "1024" })
-  int maxReadBytes = 1024;
+  @Param({ "987" })
+  int maxReadBytes = 987;
 
-  @Param({ "1024" })
-  int maxWriteBytes = 1024;
+  @Param({ "1298" })
+  int maxWriteBytes = 1298;
 
-  @Param({ "2048" })
-  int requestSize = 2048;
+  @Param({ "2109" })
+  int requestSize = 2109;
 
-  @Param({ "1" })
-  int responseFactor = 1;
+  @Param({ "16" })
+  int responseFactor = 16;
 
   byte[] requestBytes;
 
@@ -205,23 +206,13 @@ public class BufferPerformanceBench {
     }
   }
 
-  /*
-   * The state class hierarchy is larger than it needs to be due to a JMH
-   * issue where states inheriting setup methods depending on another state
-   * do not get initialized correctly from benchmark methods making use
-   * of groups. To work around, we leave the common setup and tear down code
-   * in superclasses and move the setup method depending on the bench state
-   * to subclasses. Without the workaround, it would have been enough for
-   * `ColdBuffers` to inherit from `HotBuffers`.
-   */
-
   @State(Scope.Thread)
   public static class ResponseHandler extends BufferSetup {
 
     private RequestQueue requests;
 
-    @Setup
-    public void setupBench(RequestQueue requests) {
+    @Setup(Level.Iteration)
+    public void setupQueue(RequestQueue requests) {
       super.bench = requests.bench;
       this.requests = requests;
     }
@@ -250,15 +241,28 @@ public class BufferPerformanceBench {
     }
   }
 
+  @AuxCounters
   @State(Scope.Thread)
   public static class RequestHandler extends BufferSetup {
 
     private RequestQueue requests;
 
-    @Setup
+    /** JMH will include the fields below as secondary results.*/
+    public long okResponses;
+    public long goAwayResponses;
+
+    @Setup(Level.Iteration)
     public void setupQueue(RequestQueue requests) {
       super.bench = requests.bench;
       this.requests = requests;
+    }
+
+    @Setup(Level.Iteration)
+    public void resetCounters() {
+      // See `AuxCounters` docs; we have to reset them manually
+      // between iterations.
+      okResponses = 0;
+      goAwayResponses = 0;
     }
 
     boolean enqueueRequest(byte[] requestBytes) throws IOException {
@@ -266,12 +270,14 @@ public class BufferPerformanceBench {
 
       int currentCount = requests.count.get();
       if (currentCount < MaxRequests) {
+        okResponses++;
         Request request = new Request(receive(requestBytes, process), System.nanoTime());
 
         requests.queue.add(request);
         return requests.lazyAddAndGet(1) < MaxRequests;
       }
-      // If queue is full, we send a quick response that's same size as the request instead.
+      // If queue is full, we send a quick "go away" response.
+      goAwayResponses++;
       transmit(requestBytes, process).readAll(NullSink);
       return false;
     }
@@ -290,7 +296,6 @@ public class BufferPerformanceBench {
     public void setupBench(BufferPerformanceBench bench) {
       this.bench = bench;
     }
-
 
     void sweepAndExpire(long timeOutNanos) throws IOException {
       Iterator<Request> index = queue.iterator();
@@ -313,6 +318,7 @@ public class BufferPerformanceBench {
      * (which we don't).
      */
     int lazyAddAndGet(int delta) {
+//      return count.addAndGet(delta);
       for (;;) {
         int current = count.get();
         int next = current + delta;
@@ -360,6 +366,16 @@ public class BufferPerformanceBench {
     }
 
   }
+
+  /*
+   * The state class hierarchy is larger than it needs to be due to a JMH
+   * issue where states inheriting setup methods depending on another state
+   * do not get initialized correctly from benchmark methods making use
+   * of groups. To work around, we leave the common setup and tear down code
+   * in superclasses and move the setup method depending on the bench state
+   * to subclasses. Without the workaround, it would have been enough for
+   * `ColdBuffers` to inherit from `HotBuffers`.
+   */
 
   @State(Scope.Thread)
   public static abstract class BufferSetup extends BufferState {
