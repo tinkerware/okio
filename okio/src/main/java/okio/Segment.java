@@ -26,7 +26,7 @@ import static okio.Util.currentPool;
  * <p>Each segment in the pool is a singly-linked list node referencing the rest
  * of segments in the pool.
  */
-final class Segment {
+class Segment {
   /** The size of all segments in bytes. */
   // TODO: Using fixed-size segments makes pooling easier. But it harms memory
   //       efficiency and encourages copying. Try variable sized segments?
