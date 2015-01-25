@@ -13,7 +13,6 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -21,6 +20,8 @@ import java.util.logging.Logger;
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
 import okio.pool.PoolMetrics;
+
+import static java.util.Objects.requireNonNull;
 
 /**
  * A segment pool that allocates segments from thread-local arenas.
@@ -39,10 +40,9 @@ class ArenaSegmentPool implements AllocatingPool {
 
   static {
     ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
-      final AtomicInteger id = new AtomicInteger();
 
       @Override public Thread newThread(Runnable r) {
-        Thread thread = new Thread(r, "Okio Pool Worker - " + id.incrementAndGet());
+        Thread thread = new Thread(r, "Okio Pool Worker");
         thread.setDaemon(true);
         return thread;
       }
@@ -67,6 +67,22 @@ class ArenaSegmentPool implements AllocatingPool {
   }
 
   /**
+   * Arenas track their segments; a segment is always recycled at its owner
+   * arena. This avoids a pitfall of thread-local allocators where less busy
+   * threads (or worse, low priority background tasks) may consume a buffer
+   * created by a busy thread and end up recycling segments on their own
+   * arenas, away from where they are needed. Also, we get to avoid a
+   * thread-local lookup on recycle.
+   */
+  private static class ArenaSegment extends Segment {
+    final ArenaRef arena;
+
+    ArenaSegment(Arena arena) {
+      this.arena = arena.ref();
+    }
+  }
+
+  /**
    * A separate region of memory used to allocate and recycle segments. An arena
    * is implicitly tied to a single thread, known as its local thread. Arena's
    * associated with other threads are siblings.
@@ -77,15 +93,23 @@ class ArenaSegmentPool implements AllocatingPool {
      * The pool is only modified at the head by the arena's thread. Other arenas
      * may steal free segments from the tail.
      */
-    private final ConcurrentLinkedDeque<Segment> pool = new ConcurrentLinkedDeque<>();
+    private final ConcurrentLinkedDeque<ArenaSegment> pool = new ConcurrentLinkedDeque<>();
 
     /**
      * The total number of free bytes currently in the pool; never negative.
      */
     private final AtomicLong byteCount = new AtomicLong();
 
+    private final long threadId = Thread.currentThread().getId();
+
+    private final ArenaRef selfRef;
+
     Arena() {
-      // constructor exists as target for the ignore JDK annotation only
+      this.selfRef = new ArenaRef(this);
+    }
+
+    ArenaRef ref() {
+      return selfRef;
     }
 
     /**
@@ -108,7 +132,7 @@ class ArenaSegmentPool implements AllocatingPool {
     private Segment stealOrAllocate() {
       Segment result = randomArena().stealSegment(this);
       if (result == null) {
-        result = new Segment();
+        result = new ArenaSegment(this);
         recorder.recordUse(Segment.SIZE, true);
       }
       return result;
@@ -116,19 +140,30 @@ class ArenaSegmentPool implements AllocatingPool {
 
     /**
      * Recycles a segment to be free so that it can be reserved again at a later time.
-     * The recycled segment is pushed on the front of the queue; we will never contend
+     * The recycled segment is enqueued at the head of the queue; we will never contend
      * with same-thread takes and only rarely have to contend with siblings.
      */
-    void recycleLocal(Segment segment) {
+    void recycle(ArenaSegment segment) {
       if (byteCount.get() >= ARENA_SIZE_HIGHMARK) {
         recorder.recordRecycle(Segment.SIZE, true);
         return;
       }
-      pool.offerFirst(segment);
+
+      if (inLocalThread()) {
+        pool.offerFirst(segment);
+      }
+      else {
+        pool.offerLast(segment);
+      }
       byteCount.addAndGet(Segment.SIZE);
       recorder.recordRecycle(Segment.SIZE, false);
     }
 
+    private boolean inLocalThread() {
+      return threadId == Thread.currentThread().getId();
+    }
+
+    // Visible for testing.
     int segmentCount() {
       return pool.size();
     }
@@ -191,8 +226,8 @@ class ArenaSegmentPool implements AllocatingPool {
    */
   private static class ArenaRef extends WeakReference<Arena> {
 
-    public ArenaRef(Arena referent) {
-      super(referent);
+    public ArenaRef(Arena enclosing) {
+      super(enclosing);
     }
 
     Segment stealSegment(Arena thief) {
@@ -200,6 +235,15 @@ class ArenaSegmentPool implements AllocatingPool {
       return arena != null && arena != thief ? arena.steal() : null;
     }
 
+    boolean recycleSegment(ArenaSegment segment) {
+      if (this != segment.arena) throw new IllegalArgumentException("this != segment.arena");
+      Arena arena = get();
+      if (arena != null) {
+        arena.recycle(segment);
+        return true;
+      }
+      return false;
+    }
   }
 
   class CleanTask implements Runnable {
@@ -236,7 +280,7 @@ class ArenaSegmentPool implements AllocatingPool {
   final ThreadLocal<Arena> arena = new ThreadLocal<Arena>() {
     @Override protected Arena initialValue() {
       Arena arena = createArena();
-      allArenas.add(new ArenaRef(arena));
+      allArenas.add(arena.ref());
       return arena;
     }
 
@@ -278,9 +322,18 @@ class ArenaSegmentPool implements AllocatingPool {
   }
 
   @Override public void recycle(Segment segment) {
-    checkState();
     segment.reset();
-    arena.get().recycleLocal(segment);
+
+    // We tolerate foreign segments to avoid hard-to-debug issues if
+    // buffers created prior to a Util.installPool call were used
+    // alongside buffers created later.
+    if (!(running && requireNonNull(segment) instanceof ArenaSegment)) return;
+
+    ArenaSegment arenaSegment = (ArenaSegment) segment;
+    if (!arenaSegment.arena.recycleSegment(arenaSegment)) {
+      // Arena has been reclaimed, discard this segment.
+      recorder.recordRecycle(Segment.SIZE, true);
+    }
   }
 
   @Override public PoolMetrics metrics() {
