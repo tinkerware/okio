@@ -28,7 +28,7 @@
 
     <!-- Dependencies -->
     <animal.sniffer.version>1.10</animal.sniffer.version>
-    <jmh.version>1.4.1</jmh.version>
+    <jmh.version>1.5</jmh.version>
 
     <!-- Test Dependencies -->
     <junit.version>4.11</junit.version>
