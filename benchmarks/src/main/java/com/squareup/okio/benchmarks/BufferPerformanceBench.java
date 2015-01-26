@@ -21,9 +21,13 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -36,6 +40,7 @@ import org.openjdk.jmh.annotations.GroupThreads;
 import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.Measurement;
 import org.openjdk.jmh.annotations.Mode;
+import org.openjdk.jmh.annotations.OperationsPerInvocation;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
 import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
@@ -44,6 +49,8 @@ import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
+import org.openjdk.jmh.infra.BenchmarkParams;
+import org.openjdk.jmh.infra.ThreadParams;
 
 import okio.Buffer;
 import okio.BufferedSource;
@@ -64,7 +71,7 @@ public class BufferPerformanceBench {
   public static final File OriginPath =
       new File(System.getProperty("okio.bench.origin.path", "/dev/urandom"));
 
-  public static final int MaxRequests = 1000;
+  public static final int MaxRequests = 10000;
 
   @Param({ "1000" })
   int maxThinkMicros = 1000;
@@ -85,7 +92,7 @@ public class BufferPerformanceBench {
 
   byte[] responseBytes;
 
-  @Setup(Level.Trial)
+  @Setup
   public void storeRequestResponseData() throws IOException {
     checkOrigin(OriginPath);
 
@@ -185,15 +192,16 @@ public class BufferPerformanceBench {
   @Benchmark
   @GroupThreads(6)
   @Group("cold")
+  @OperationsPerInvocation(10)
   public void writeResponseCold(ResponseHandler responses) throws IOException {
-    responses.processResponse(responseBytes).readAll(NullSink);
+    responses.processResponseBatch(responseBytes, NullSink);
   }
 
   @Benchmark
   @GroupThreads(1)
   @Group("cold")
   public void sweepAndExpire(Sweeper sweeper) throws IOException {
-    sweeper.sweepAndExpire(2 * maxThinkMicros, TimeUnit.MICROSECONDS);
+    sweeper.sweepAndExpireWithTimeOut(2 * maxThinkMicros, TimeUnit.MICROSECONDS);
   }
 
   static class Request {
@@ -201,38 +209,55 @@ public class BufferPerformanceBench {
     final long receivedAt;
 
     Request(Buffer data, long receivedAt) {
-      this.data = data;
+      this.data = requireNonNull(data);
       this.receivedAt = receivedAt;
     }
   }
 
+  @AuxCounters
   @State(Scope.Thread)
   public static class ResponseHandler extends BufferSetup {
 
     private RequestQueue requests;
+    private Queue<Request> queue;
+    private List<Request> batch;
+
+    public long okResponses;
 
     @Setup(Level.Iteration)
-    public void setupQueue(RequestQueue requests) {
+    public void setupQueue(RequestQueue requests, ThreadParams params) {
       super.bench = requests.bench;
       this.requests = requests;
+      this.queue = requests.ensureQueue(params.getSubgroupThreadIndex());
+      this.batch = new ArrayList<>(10);
+      okResponses = 0;
     }
 
-    private Request nextRequest() {
+    private List<Request> nextBatch() {
+      batch.clear();
       int polls = 0;
-      Request result;
-      while((result = requests.queue.poll()) == null && ++polls < 10) {
-        // We expect to spin rarely, if ever; requests are hot.
-        Thread.yield();
+
+      nextPoll:
+      while (polls++ < 10) {
+        Request request;
+        while ((request = queue.poll()) == null) {
+          // We expect to spin rarely, if ever; requests are hot.
+          Thread.yield();
+          continue nextPoll;
+        }
+        batch.add(request);
       }
-      assert result != null;
-      requests.lazyAddAndGet(-1);
-      return result;
+      requests.lazyAddAndGet(-batch.size());
+      return batch;
     }
 
-    BufferedSource processResponse(byte[] responseBytes) throws IOException {
-      Request request = nextRequest();
-      request.data.readAll(NullSink);
-      return transmit(responseBytes, new Buffer());
+    void processResponseBatch(byte[] responseBytes, Sink sink) throws IOException {
+      List<Request> batch = nextBatch();
+      for (Request request : batch) {
+        request.data.readAll(NullSink);
+        transmit(responseBytes, new Buffer()).readAll(sink);
+        okResponses++;
+      }
     }
 
     @Setup(Level.Invocation)
@@ -246,23 +271,29 @@ public class BufferPerformanceBench {
   public static class RequestHandler extends BufferSetup {
 
     private RequestQueue requests;
+    private int queueIndex = 0;
+    private int queueCount;
 
-    /** JMH will include the fields below as secondary results.*/
-    public long okResponses;
     public long goAwayResponses;
 
     @Setup(Level.Iteration)
-    public void setupQueue(RequestQueue requests) {
+    public void setupQueue(RequestQueue requests, BenchmarkParams params) {
       super.bench = requests.bench;
       this.requests = requests;
+      this.queueCount = maxOf(params.getThreadGroups());
+      this.goAwayResponses = 0;
     }
 
-    @Setup(Level.Iteration)
-    public void resetCounters() {
-      // See `AuxCounters` docs; we have to reset them manually
-      // between iterations.
-      okResponses = 0;
-      goAwayResponses = 0;
+    public long expires() {
+      return requests.expireCount;
+    }
+
+    private int maxOf(int... values) {
+      int max = 0;
+      for (int value : values) {
+        max = Math.max(max, value);
+      }
+      return max;
     }
 
     boolean enqueueRequest(byte[] requestBytes) throws IOException {
@@ -270,10 +301,9 @@ public class BufferPerformanceBench {
 
       int currentCount = requests.count.get();
       if (currentCount < MaxRequests) {
-        okResponses++;
         Request request = new Request(receive(requestBytes, process), System.nanoTime());
 
-        requests.queue.add(request);
+        currentQueue().add(request);
         return requests.lazyAddAndGet(1) < MaxRequests;
       }
       // If queue is full, we send a quick "go away" response.
@@ -281,35 +311,79 @@ public class BufferPerformanceBench {
       transmit(requestBytes, process).readAll(NullSink);
       return false;
     }
+
+    private Queue<Request> currentQueue() {
+      // Spray requests over all response handler queues.
+      Queue<Request> queue = requests.queues.get(queueIndex++);
+      queueIndex %= queueCount;
+      return queue;
+    }
   }
 
   @State(Scope.Group)
   public static class RequestQueue {
-    /* A bounded queue for requests */
-    final Queue<Request> queue = new ConcurrentLinkedQueue<>();
-    /* Count of in-flight requests */
+    // Count of in-flight requests.
     final AtomicInteger count = new AtomicInteger();
-    /* Bench parameters*/
+    // Total count of expires performed in an iteration;
+    // written by expire thread only and volatile to ensure
+    // counter reads observe latest write.
+    volatile long expireCount;
+    // Bench parameters.
     private BufferPerformanceBench bench;
+    // One queue per response handler.
+    private final CopyOnWriteArrayList<Queue<Request>> queues =
+        new CopyOnWriteArrayList<>(Collections.<Queue<Request>>nCopies(16, null));
 
-    @Setup
+    @Setup(Level.Trial)
     public void setupBench(BufferPerformanceBench bench) {
       this.bench = bench;
     }
 
+    @Setup(Level.Iteration)
+    public void resetCounters() {
+      expireCount = 0;
+    }
+
+    /**
+     * Ensures that a queue exists for the given queue index and returns it.
+     * We resort to this kind of lazy initialization for request queues due to
+     * a JMH issue in injecting benchmark parameters to any state that does not
+     * have the thread scope.
+     */
+    Queue<Request> ensureQueue(int queueIndex) {
+      Queue<Request> result = queues.get(queueIndex);
+      if (result != null) {
+        result.clear();
+        return result;
+      }
+      result = new ConcurrentLinkedQueue<>();
+      queues.set(queueIndex, result);
+      return result;
+    }
+
     void sweepAndExpire(long timeOutNanos) throws IOException {
+      for (Queue<Request> queue : queues) {
+        if (queue != null) {
+          int expired = sweepQueue(queue, timeOutNanos);
+          expireCount += expired;
+          count.addAndGet(-expired);
+        }
+      }
+    }
+
+    private int sweepQueue(Queue<Request> queue, long timeOutNanos) {
       Iterator<Request> index = queue.iterator();
       int expired = 0;
       long start = System.nanoTime();
       while(index.hasNext()) {
         Request request = index.next();
         long deadline = request.receivedAt + timeOutNanos;
-        if (deadline >= start) {
+        if (deadline <= start) {
           index.remove();
           expired++;
         }
       }
-      count.addAndGet(-expired);
+      return expired;
     }
 
     /**
@@ -339,7 +413,7 @@ public class BufferPerformanceBench {
       this.requests = requests;
     }
 
-    void sweepAndExpire(long timeOut, TimeUnit unit) throws IOException {
+    void sweepAndExpireWithTimeOut(long timeOut, TimeUnit unit) throws IOException {
       requests.sweepAndExpire(unit.toNanos(timeOut));
     }
 
