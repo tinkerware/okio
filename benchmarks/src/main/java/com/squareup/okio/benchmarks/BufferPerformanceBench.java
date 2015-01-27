@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -71,6 +72,7 @@ public class BufferPerformanceBench {
   public static final File OriginPath =
       new File(System.getProperty("okio.bench.origin.path", "/dev/urandom"));
 
+  /** Maximum size of a request queue. */
   public static final int MaxRequests = 10000;
 
   @Param({ "1000" })
@@ -140,7 +142,6 @@ public class BufferPerformanceBench {
    * configurable number of microseconds (1000 by default).
    */
 
-
   @Benchmark
   @Threads(1)
   public void threads1hot(HotBuffers buffers) throws IOException {
@@ -190,7 +191,7 @@ public class BufferPerformanceBench {
   }
 
   @Benchmark
-  @GroupThreads(6)
+  @GroupThreads(2)
   @Group("cold")
   @OperationsPerInvocation(10)
   public void writeResponseCold(ResponseHandler responses) throws IOException {
@@ -205,6 +206,7 @@ public class BufferPerformanceBench {
   }
 
   static class Request {
+
     final Buffer data;
     final long receivedAt;
 
@@ -220,17 +222,21 @@ public class BufferPerformanceBench {
 
     private RequestQueue requests;
     private Queue<Request> queue;
-    private List<Request> batch;
+    private ArrayList<Request> batch;
+    private int batchSize;
 
     public long okResponses;
 
     @Setup(Level.Iteration)
-    public void setupQueue(RequestQueue requests, ThreadParams params) {
+    public void setupQueue(RequestQueue requests,
+                           BenchmarkParams benchParams,
+                           ThreadParams threadParams) throws InterruptedException {
       super.bench = requests.bench;
       this.requests = requests;
-      this.queue = requests.ensureQueue(params.getSubgroupThreadIndex());
-      this.batch = new ArrayList<>(10);
-      okResponses = 0;
+      this.batchSize = benchParams.getOpsPerInvocation();
+      this.batch = new ArrayList<>(batchSize);
+      this.queue = requests.ensureQueue(threadParams.getSubgroupThreadIndex());
+      this.okResponses = 0;
     }
 
     private List<Request> nextBatch() {
@@ -238,7 +244,7 @@ public class BufferPerformanceBench {
       int polls = 0;
 
       nextPoll:
-      while (polls++ < 10) {
+      while (polls++ < batchSize) {
         Request request;
         while ((request = queue.poll()) == null) {
           // We expect to spin rarely, if ever; requests are hot.
@@ -271,21 +277,18 @@ public class BufferPerformanceBench {
   public static class RequestHandler extends BufferSetup {
 
     private RequestQueue requests;
-    private int queueIndex = 0;
+    private int queueIndex;
     private int queueCount;
 
     public long goAwayResponses;
 
     @Setup(Level.Iteration)
-    public void setupQueue(RequestQueue requests, BenchmarkParams params) {
+    public void setupQueue(RequestQueue requests, BenchmarkParams benchParams) {
       super.bench = requests.bench;
       this.requests = requests;
-      this.queueCount = maxOf(params.getThreadGroups());
       this.goAwayResponses = 0;
-    }
-
-    public long expires() {
-      return requests.expireCount;
+      this.queueCount = maxOf(benchParams.getThreadGroups());
+      requests.awaitQueuesReady(queueCount);
     }
 
     private int maxOf(int... values) {
@@ -294,6 +297,10 @@ public class BufferPerformanceBench {
         max = Math.max(max, value);
       }
       return max;
+    }
+
+    public long expires() {
+      return requests.expireCount;
     }
 
     boolean enqueueRequest(byte[] requestBytes) throws IOException {
@@ -322,6 +329,7 @@ public class BufferPerformanceBench {
 
   @State(Scope.Group)
   public static class RequestQueue {
+
     // Count of in-flight requests.
     final AtomicInteger count = new AtomicInteger();
     // Total count of expires performed in an iteration;
@@ -334,6 +342,24 @@ public class BufferPerformanceBench {
     private final CopyOnWriteArrayList<Queue<Request>> queues =
         new CopyOnWriteArrayList<>(Collections.<Queue<Request>>nCopies(16, null));
 
+    /*
+     * We have to play a game of lazy initialization between the request and
+     * response handlers, with the request queue mediating between them as
+     * the coordinator since it is known to both. The request handler uses
+     * `requestHandlerReady` to get notified when all response handlers
+     * finish setting up their queues. In turn, the response handlers signal
+     * completion of their queue setup through `responseHandlersReady`.
+     * The parent-child relationship between the two phasers ensures that
+     * when all response handlers deregister, the child phaser terminates
+     * and deregisters itself from the parent phaser.
+     */
+    private final Phaser requestHandlerReady = new Phaser(1);
+    private final Phaser responseHandlersReady = new Phaser(requestHandlerReady) {
+      @Override protected boolean onAdvance(int phase, int registeredParties) {
+        return false;
+      }
+    };
+
     @Setup(Level.Trial)
     public void setupBench(BufferPerformanceBench bench) {
       this.bench = bench;
@@ -345,19 +371,37 @@ public class BufferPerformanceBench {
     }
 
     /**
-     * Ensures that a queue exists for the given queue index and returns it.
-     * We resort to this kind of lazy initialization for request queues due to
-     * a JMH issue in injecting benchmark parameters to any state that does not
-     * have the thread scope.
+     * Ensures that the given number of queues exist for a request handler's use,
+     * waiting for response handlers to call `ensureQueue` as needed before returning
+     * to the request handler.
      */
-    Queue<Request> ensureQueue(int queueIndex) {
-      Queue<Request> result = queues.get(queueIndex);
-      if (result != null) {
-        result.clear();
-        return result;
+    void awaitQueuesReady(int queueCount) {
+      responseHandlersReady.bulkRegister(queueCount);
+      requestHandlerReady.awaitAdvance(requestHandlerReady.arrive());
+    }
+
+    /**
+     * Ensures that a queue exists for the given queue index and returns it to a response handler.
+     * We resort to this kind of lazy initialization for request queues due to a JMH issue in
+     * injecting benchmark parameters to a group state that does not have the thread scope.
+     */
+    Queue<Request> ensureQueue(int queueIndex) throws InterruptedException {
+      // Wait for request handler to arrive.
+      while (responseHandlersReady.getRegisteredParties() == 0) {
+        // Let the response handler spin lazily until the request handler
+        // registers the expected queue count.
+        Thread.yield();
       }
-      result = new ConcurrentLinkedQueue<>();
-      queues.set(queueIndex, result);
+
+      Queue<Request> result = queues.get(queueIndex);
+      if (result == null) {
+        result = new ConcurrentLinkedQueue<>();
+        queues.set(queueIndex, result);
+      }
+      else {
+        result.clear();
+      }
+      responseHandlersReady.arriveAndDeregister();
       return result;
     }
 
@@ -375,7 +419,7 @@ public class BufferPerformanceBench {
       Iterator<Request> index = queue.iterator();
       int expired = 0;
       long start = System.nanoTime();
-      while(index.hasNext()) {
+      while (index.hasNext()) {
         Request request = index.next();
         long deadline = request.receivedAt + timeOutNanos;
         if (deadline <= start) {
@@ -387,13 +431,12 @@ public class BufferPerformanceBench {
     }
 
     /**
-     * We do not need memory effects of CAS for updating request counts;
-     * the queue operations would take care of that if we depended on them
-     * (which we don't).
+     * We do not need memory effects of CAS for updating request counts; the queue operations would
+     * take care of that if we depended on them (which we don't).
      */
     int lazyAddAndGet(int delta) {
 //      return count.addAndGet(delta);
-      for (;;) {
+      for (; ; ) {
         int current = count.get();
         int next = current + delta;
         if (count.weakCompareAndSet(current, next)) {
@@ -453,6 +496,7 @@ public class BufferPerformanceBench {
 
   @State(Scope.Thread)
   public static abstract class BufferSetup extends BufferState {
+
     BufferPerformanceBench bench;
 
     public Buffer receive(byte[] bytes, Buffer process) throws IOException {
@@ -482,8 +526,8 @@ public class BufferPerformanceBench {
 
     /**
      * Fills up the receive buffer, hands off to process buffer and returns it for consuming.
-     * Expects receive and process buffers to be empty. Leaves the receive buffer empty and
-     * process buffer full.
+     * Expects receive and process buffers to be empty. Leaves the receive buffer empty and process
+     * buffer full.
      */
     protected Buffer receive(byte[] bytes, Buffer process, int maxChunkSize) throws IOException {
       writeChunked(received, bytes, maxChunkSize).readAll(process);
@@ -491,9 +535,8 @@ public class BufferPerformanceBench {
     }
 
     /**
-     * Fills up the process buffer, hands off to send buffer and returns it for consuming.
-     * Expects process and sent buffers to be empty. Leaves the process buffer empty and
-     * sent buffer full.
+     * Fills up the process buffer, hands off to send buffer and returns it for consuming. Expects
+     * process and sent buffers to be empty. Leaves the process buffer empty and sent buffer full.
      */
     protected Buffer transmit(byte[] bytes, Buffer process, int maxChunkSize) throws IOException {
       writeChunked(process, bytes, maxChunkSize).readAll(sent);
