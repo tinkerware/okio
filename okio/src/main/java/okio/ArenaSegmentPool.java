@@ -3,6 +3,8 @@ package okio;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Deque;
+import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
@@ -58,7 +60,7 @@ class ArenaSegmentPool implements AllocatingPool {
 
   private static boolean checkRuntime() {
     try {
-      Class.forName("java.util.concurrent.ConcurrentLinkedDeque");
+      Class.forName("java.util.concurrent.ThreadLocalRandom");
       return true;
     }
     catch (ClassNotFoundException e) {
@@ -93,7 +95,7 @@ class ArenaSegmentPool implements AllocatingPool {
      * The pool is only modified at the head by the arena's thread. Other arenas
      * may steal free segments from the tail.
      */
-    private final ConcurrentLinkedDeque<ArenaSegment> pool = new ConcurrentLinkedDeque<>();
+    private final Deque<ArenaSegment> pool = new ConcurrentLinkedDeque<>();
 
     /**
      * The total number of free bytes currently in the pool; never negative.
@@ -288,7 +290,7 @@ class ArenaSegmentPool implements AllocatingPool {
 
   private final ScheduledFuture<?> taskHandle;
 
-  private final CopyOnWriteArrayList<ArenaRef> allArenas = new CopyOnWriteArrayList<>();
+  private final List<ArenaRef> allArenas = new CopyOnWriteArrayList<>();
 
   private final PoolMetrics.Recorder recorder = new PoolMetrics.Recorder();
 
