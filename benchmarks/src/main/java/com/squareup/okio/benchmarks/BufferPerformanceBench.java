@@ -27,10 +27,10 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 import org.openjdk.jmh.annotations.AuxCounters;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -94,12 +94,15 @@ public class BufferPerformanceBench {
 
   byte[] responseBytes;
 
+  long requestTimeoutNanos;
+
   @Setup
   public void storeRequestResponseData() throws IOException {
     checkOrigin(OriginPath);
 
     requestBytes = storeSourceData(new byte[requestSize]);
     responseBytes = storeSourceData(new byte[requestSize * responseFactor]);
+    requestTimeoutNanos = 5 * TimeUnit.MICROSECONDS.toNanos(maxThinkMicros);
   }
 
   /* Test Workload
@@ -202,17 +205,24 @@ public class BufferPerformanceBench {
   @GroupThreads(1)
   @Group("cold")
   public void sweepAndExpire(Sweeper sweeper) throws IOException {
-    sweeper.sweepAndExpireWithTimeOut(2 * maxThinkMicros, TimeUnit.MICROSECONDS);
+    sweeper.sweepAndExpire();
   }
 
   static class Request {
 
-    final Buffer data;
+    volatile Buffer data;
     final long receivedAt;
+
+    private static final AtomicReferenceFieldUpdater<Request, Buffer> atomicData =
+        AtomicReferenceFieldUpdater.newUpdater(Request.class, Buffer.class, "data");
 
     Request(Buffer data, long receivedAt) {
       this.data = requireNonNull(data);
       this.receivedAt = receivedAt;
+    }
+
+    boolean casData(Buffer expected, Buffer updated) {
+      return atomicData.compareAndSet(this, expected, updated);
     }
   }
 
@@ -220,6 +230,7 @@ public class BufferPerformanceBench {
   @State(Scope.Thread)
   public static class ResponseHandler extends BufferSetup {
 
+    private final Buffer process = new Buffer();
     private RequestQueue requests;
     private Queue<Request> queue;
     private ArrayList<Request> batch;
@@ -259,10 +270,22 @@ public class BufferPerformanceBench {
 
     void processResponseBatch(byte[] responseBytes, Sink sink) throws IOException {
       List<Request> batch = nextBatch();
+      long lastSweep = requests.lastSweep;
       for (Request request : batch) {
-        request.data.readAll(NullSink);
-        transmit(responseBytes, new Buffer()).readAll(sink);
-        okResponses++;
+        Buffer data = requests.reclaimAliveRequest(request, lastSweep);
+        if (data != null) {
+          data.readAll(NullSink);
+          transmit(responseBytes, process).readAll(sink);
+          okResponses++;
+        }
+        else {
+          data = requests.reclaimExpiredRequest(request, lastSweep);
+          if (data != null) {
+            data.clear();
+            requests.expireCount.incrementAndGet();
+          }
+          // already reclaimed by a later sweeper
+        }
       }
     }
 
@@ -299,14 +322,14 @@ public class BufferPerformanceBench {
       return max;
     }
 
-    public long expires() {
-      return requests.expireCount;
+    public int expires() {
+      return requests.expireCount.get();
     }
 
     boolean enqueueRequest(byte[] requestBytes) throws IOException {
       Buffer process = new Buffer();
 
-      int currentCount = requests.count.get();
+      int currentCount = requests.requestCount.get();
       if (currentCount < MaxRequests) {
         Request request = new Request(receive(requestBytes, process), System.nanoTime());
 
@@ -331,16 +354,17 @@ public class BufferPerformanceBench {
   public static class RequestQueue {
 
     // Count of in-flight requests.
-    final AtomicInteger count = new AtomicInteger();
-    // Total count of expires performed in an iteration;
+    final AtomicInteger requestCount = new AtomicInteger();
+    // Total requestCount of expires performed in an iteration;
     // written by expire thread only and volatile to ensure
     // counter reads observe latest write.
-    volatile long expireCount;
+    AtomicInteger expireCount = new AtomicInteger();
     // Bench parameters.
     private BufferPerformanceBench bench;
     // One queue per response handler.
-    private final CopyOnWriteArrayList<Queue<Request>> queues =
-        new CopyOnWriteArrayList<>(Collections.<Queue<Request>>nCopies(16, null));
+    private List<Queue<Request>> queues;
+    // Timestamp of last started sweep.
+    private volatile long lastSweep;
 
     /*
      * We have to play a game of lazy initialization between the request and
@@ -367,15 +391,26 @@ public class BufferPerformanceBench {
 
     @Setup(Level.Iteration)
     public void resetCounters() {
-      expireCount = 0;
+      lastSweep = System.nanoTime();
+      requestCount.set(0);
+      expireCount.set(0);
+    }
+
+    @TearDown(Level.Iteration)
+    public void reclaimAll() throws InterruptedException {
+      // Wait until most recent request times out.
+      TimeUnit.NANOSECONDS.sleep(bench.requestTimeoutNanos);
+      sweepAndExpire();
+      queues = null;
     }
 
     /**
-     * Ensures that the given number of queues exist for a request handler's use,
-     * waiting for response handlers to call `ensureQueue` as needed before returning
-     * to the request handler.
+     * Ensures that the given number of queues exist for a request handler's use, waiting for
+     * response handlers to call `ensureQueue` as needed before returning to the request handler.
      */
     void awaitQueuesReady(int queueCount) {
+      queues = new ArrayList<>(Collections.<Queue<Request>>nCopies(queueCount, null));
+
       responseHandlersReady.bulkRegister(queueCount);
       requestHandlerReady.awaitAdvance(requestHandlerReady.arrive());
     }
@@ -389,45 +424,66 @@ public class BufferPerformanceBench {
       // Wait for request handler to arrive.
       while (responseHandlersReady.getRegisteredParties() == 0) {
         // Let the response handler spin lazily until the request handler
-        // registers the expected queue count.
+        // registers the expected queue requestCount.
         Thread.yield();
       }
 
+      // Happens-before relationship imposed by phaser registration and
+      // arrival operations is enough to properly publish updates to `queues`.
       Queue<Request> result = queues.get(queueIndex);
       if (result == null) {
         result = new ConcurrentLinkedQueue<>();
         queues.set(queueIndex, result);
       }
-      else {
-        result.clear();
-      }
       responseHandlersReady.arriveAndDeregister();
       return result;
     }
 
-    void sweepAndExpire(long timeOutNanos) throws IOException {
+    void sweepAndExpire() {
       for (Queue<Request> queue : queues) {
         if (queue != null) {
-          int expired = sweepQueue(queue, timeOutNanos);
-          expireCount += expired;
-          count.addAndGet(-expired);
+          int expired = sweepQueue(queue);
+          requestCount.addAndGet(-expired);
+          expireCount.addAndGet(expired);
         }
       }
     }
 
-    private int sweepQueue(Queue<Request> queue, long timeOutNanos) {
+    private int sweepQueue(Queue<Request> queue) {
       Iterator<Request> index = queue.iterator();
       int expired = 0;
-      long start = System.nanoTime();
+      lastSweep = System.nanoTime();
+      long start = lastSweep;
       while (index.hasNext()) {
         Request request = index.next();
-        long deadline = request.receivedAt + timeOutNanos;
-        if (deadline <= start) {
+        Buffer data = reclaimExpiredRequest(request, start);
+        if (data != null) {
           index.remove();
+          data.clear();
           expired++;
         }
       }
       return expired;
+    }
+
+    Buffer reclaimExpiredRequest(Request request, long earliestAlive) {
+      long deadline = request.receivedAt + bench.requestTimeoutNanos;
+      Buffer data;
+      if (deadline <= earliestAlive && request.casData((data = request.data), null)) {
+        return data;
+      }
+
+      return null;
+    }
+
+    Buffer reclaimAliveRequest(Request request, long earliestAlive) {
+      long deadline = request.receivedAt + bench.requestTimeoutNanos;
+      Buffer data;
+      if (deadline > earliestAlive && request.casData((data = request.data), null)) {
+        return data;
+      }
+
+      return null;
     }
 
     /**
@@ -435,11 +491,11 @@ public class BufferPerformanceBench {
      * take care of that if we depended on them (which we don't).
      */
     int lazyAddAndGet(int delta) {
-//      return count.addAndGet(delta);
+//      return requestCount.addAndGet(delta);
       for (; ; ) {
-        int current = count.get();
+        int current = requestCount.get();
         int next = current + delta;
-        if (count.weakCompareAndSet(current, next)) {
+        if (requestCount.weakCompareAndSet(current, next)) {
           return next;
         }
       }
@@ -456,8 +512,8 @@ public class BufferPerformanceBench {
       this.requests = requests;
     }
 
-    void sweepAndExpireWithTimeOut(long timeOut, TimeUnit unit) throws IOException {
-      requests.sweepAndExpire(unit.toNanos(timeOut));
+    void sweepAndExpire() throws IOException {
+      requests.sweepAndExpire();
     }
 
     @Setup(Level.Invocation)
