@@ -5,11 +5,24 @@ package okio.pool;
  */
 public class PoolMetrics {
 
+  public static PoolMetrics zero() {
+    return new PoolMetrics(0, 0, 0, 0, 0, 0);
+  }
+
+  public static PoolMetrics merge(Iterable<PoolMetrics> sequence) {
+    PoolMetrics result = PoolMetrics.zero();
+    for (PoolMetrics metrics : sequence) {
+      result = result.merge(metrics);
+    }
+    return result;
+  }
+
   private final long usedByteCount;
   private final long allocatedByteCount;
   private final long outstandingByteCount;
   private final long totalAllocationCount;
   private final long totalTakeCount;
+
   private final long totalRecycleCount;
 
   private PoolMetrics(long usedByteCount,
@@ -51,57 +64,14 @@ public class PoolMetrics {
     return totalRecycleCount;
   }
 
-  public static class Recorder {
-
-    private final LongAdder usedByteCount = new LongAdder();
-    private final LongAdder allocatedByteCount = new LongAdder();
-    private final LongAdder outstandingByteCount = new LongAdder();
-    private final LongAdder totalAllocationCount = new LongAdder();
-    private final LongAdder totalTakeCount = new LongAdder();
-    private final LongAdder totalRecycleCount = new LongAdder();
-
-    public PoolMetrics snapshot() {
-      return new PoolMetrics(usedByteCount.sum(),
-                             allocatedByteCount.sum(),
-                             outstandingByteCount.sum(),
-                             totalAllocationCount.sum(),
-                             totalTakeCount.sum(),
-                             totalRecycleCount.sum());
-    }
-
-    public void recordUse(int segmentSize, boolean allocated) {
-      checkSize(segmentSize);
-
-      if (allocated) {
-        allocatedByteCount.add(segmentSize);
-        totalAllocationCount.increment();
-      }
-      else {
-        usedByteCount.add(-segmentSize);
-      }
-      outstandingByteCount.add(segmentSize);
-      totalTakeCount.increment();
-    }
-
-    public void recordRecycle(int segmentSize, boolean deallocated) {
-      checkSize(segmentSize);
-
-      if (!deallocated) {
-        usedByteCount.add(segmentSize);
-      }
-      outstandingByteCount.add(-segmentSize);
-      totalRecycleCount.increment();
-    }
-
-    public void recordTrim(int segmentSize) {
-      checkSize(segmentSize);
-      usedByteCount.add(-segmentSize);
-    }
-
-    private void checkSize(int size) {
-      if (size < 0) throw new IllegalArgumentException("size < 0");
-    }
-
+  public PoolMetrics merge(PoolMetrics other) {
+    if (other == null) throw new NullPointerException("other");
+    return new PoolMetrics(usedByteCount + other.usedByteCount,
+                           allocatedByteCount + other.allocatedByteCount,
+                           outstandingByteCount + other.outstandingByteCount,
+                           totalAllocationCount + other.totalAllocationCount,
+                           totalTakeCount + other.totalTakeCount,
+                           totalRecycleCount + other.totalRecycleCount);
   }
 
   @Override public boolean equals(Object obj) {
@@ -129,7 +99,7 @@ public class PoolMetrics {
   }
 
   @Override public String toString() {
-    return String.format("PoolMetrics[usedBytes=%d allocBytes=%d outBytes=%d totalAllocs=%d totalTakes=%d totalRecycles=%d",
+    return String.format("PoolMetrics[used=%d allocated=%d outstanding=%d allocations=%d takes=%d recycles=%d",
                          usedByteCount,
                          allocatedByteCount,
                          outstandingByteCount,
@@ -137,4 +107,49 @@ public class PoolMetrics {
                          totalTakeCount,
                          totalRecycleCount);
   }
+
+  public static class Recorder {
+
+    private long usedByteCount = 0;
+    private long allocatedByteCount = 0;
+    private long outstandingByteCount = 0;
+    private long totalAllocationCount = 0;
+    private long totalTakeCount = 0;
+    private long totalRecycleCount = 0;
+
+    public PoolMetrics snapshot() {
+      return new PoolMetrics(usedByteCount,
+                             allocatedByteCount,
+                             outstandingByteCount,
+                             totalAllocationCount,
+                             totalTakeCount,
+                             totalRecycleCount);
+    }
+
+    public void recordUse(int segmentSize, boolean allocated) {
+      if (allocated) {
+        allocatedByteCount += segmentSize;
+        totalAllocationCount++;
+      }
+      else {
+        usedByteCount -= segmentSize;
+      }
+      outstandingByteCount += segmentSize;
+      totalTakeCount++;
+    }
+
+    public void recordRecycle(int segmentSize, boolean deallocated) {
+      if (!deallocated) {
+        usedByteCount += segmentSize;
+      }
+      outstandingByteCount -= segmentSize;
+      totalRecycleCount++;
+    }
+
+    public void recordTrim(int segmentSize) {
+      usedByteCount -= segmentSize;
+    }
+
+  }
+
 }
