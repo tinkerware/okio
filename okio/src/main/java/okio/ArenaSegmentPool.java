@@ -20,9 +20,9 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import okio.pool.PoolMetrics;
+import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
-import static java.util.Objects.requireNonNull;
+import okio.pool.PoolMetrics;
 
 /**
  * A segment pool that allocates segments from thread-local arenas.
@@ -50,7 +50,6 @@ class ArenaSegmentPool implements AllocatingPool {
     });
 
     // We make sure the scheduler can be shutdown during finalization.
-    executor.setRemoveOnCancelPolicy(true);
     executor.setKeepAliveTime(ARENA_CLEAN_PERIOD_MILLIS * 2, TimeUnit.MILLISECONDS);
     executor.allowCoreThreadTimeOut(true);
 
@@ -81,7 +80,6 @@ class ArenaSegmentPool implements AllocatingPool {
 
     private final PoolMetrics.Recorder local = new PoolMetrics.Recorder();
     private final PoolMetrics.Recorder sibling = new PoolMetrics.Recorder();
-    private final long threadId;
 
     /**
      * The total number of free bytes currently in the arena; never negative.
@@ -90,10 +88,6 @@ class ArenaSegmentPool implements AllocatingPool {
     private volatile long byteCount;
     @SuppressWarnings("UnusedDeclaration")
     private volatile long totalTrimmed;
-
-    ArenaMetrics(long threadId) {
-      this.threadId = threadId;
-    }
 
     long byteCount() {
       return byteCount;
@@ -110,11 +104,18 @@ class ArenaSegmentPool implements AllocatingPool {
       return segment;
     }
 
-    void recordRecycledSegment(int segmentSize, boolean deallocated) {
+    void recordLocalRecycledSegment(int segmentSize, boolean deallocated) {
       if (!deallocated) {
         atomicBytes.getAndAdd(this, segmentSize);
       }
-      recorder().recordRecycle(segmentSize, deallocated);
+      local.recordRecycle(segmentSize, deallocated);
+    }
+
+    void recordSiblingRecycledSegment(int segmentSize, boolean deallocated) {
+      if (!deallocated) {
+        atomicBytes.getAndAdd(this, segmentSize);
+      }
+      sibling.recordRecycle(segmentSize, deallocated);
     }
 
     void recordAllocation(int segmentSize) {
@@ -130,10 +131,6 @@ class ArenaSegmentPool implements AllocatingPool {
       return local.snapshot().merge(sibling.snapshot());
     }
 
-    private PoolMetrics.Recorder recorder() {
-      return Thread.currentThread().getId() == threadId ? local : sibling;
-    }
-
     private static final AtomicLongFieldUpdater<ArenaMetrics> atomicBytes =
         AtomicLongFieldUpdater.newUpdater(ArenaMetrics.class, "byteCount");
     private static final AtomicLongFieldUpdater<ArenaMetrics> atomicTrimmed =
@@ -145,6 +142,7 @@ class ArenaSegmentPool implements AllocatingPool {
    * to a single thread, known as its local thread. Arena's associated with other threads are
    * siblings.
    */
+  @IgnoreJRERequirement
   class Arena {
 
     /**
@@ -157,12 +155,11 @@ class ArenaSegmentPool implements AllocatingPool {
 
     private final Random random = new Random();
 
+    private final ArenaMetrics metrics = new ArenaMetrics();
+
     private final ArenaRef selfRef;
 
-    private final ArenaMetrics metrics;
-
     Arena() {
-      this.metrics = new ArenaMetrics(threadId);
       this.selfRef = new ArenaRef(this);
     }
 
@@ -199,23 +196,27 @@ class ArenaSegmentPool implements AllocatingPool {
      * segment is enqueued at the head of the queue; we will never contend with same-thread takes
      * and only rarely have to contend with siblings.
      */
-    void recycle(ArenaSegment segment) {
+    void recycleLocal(ArenaSegment segment) {
       if (metrics.byteCount() >= ARENA_SIZE_HIGHMARK) {
-        metrics.recordRecycledSegment(Segment.SIZE, true);
+        metrics.recordLocalRecycledSegment(Segment.SIZE, true);
         return;
       }
 
-      if (inLocalThread()) {
-        pool.offerFirst(segment);
-      }
-      else {
-        pool.offerLast(segment);
-      }
-      metrics.recordRecycledSegment(Segment.SIZE, false);
+      pool.offerFirst(segment);
+      metrics.recordLocalRecycledSegment(Segment.SIZE, false);
     }
 
-    private boolean inLocalThread() {
-      return threadId == Thread.currentThread().getId();
+    /**
+     * Same as above, except it appends the tail so that it doesn't contend with local usage.
+     */
+    void recycleSibling(ArenaSegment segment) {
+      if (metrics.byteCount() >= ARENA_SIZE_HIGHMARK) {
+        metrics.recordSiblingRecycledSegment(Segment.SIZE, true);
+        return;
+      }
+
+      pool.offerLast(segment);
+      metrics.recordSiblingRecycledSegment(Segment.SIZE, false);
     }
 
     // Visible for testing.
@@ -288,7 +289,12 @@ class ArenaSegmentPool implements AllocatingPool {
       if (this != segment.arena) throw new IllegalArgumentException("this != segment.arena");
       Arena arena = get();
       if (arena != null) {
-        arena.recycle(segment);
+        long threadId = Thread.currentThread().getId();
+        if (arena.threadId == threadId) {
+          arena.recycleLocal(segment);
+        } else {
+          arena.recycleSibling(segment);
+        }
         return true;
       }
       return false;
@@ -465,14 +471,15 @@ class ArenaSegmentPool implements AllocatingPool {
   }
 
   @Override public void recycle(Segment segment) {
-    segment.reset();
+    if (segment == null) throw new NullPointerException("segment");
 
     // We tolerate foreign segments to avoid hard-to-debug issues if
     // buffers created prior to a Util.installPool call were used
     // alongside buffers created later.
-    if (!(running && requireNonNull(segment) instanceof ArenaSegment)) return;
+    if (!(running && segment instanceof ArenaSegment)) return;
 
     ArenaSegment arenaSegment = (ArenaSegment) segment;
+    segment.reset();
     if (!arenaSegment.arena.recycleSegment(arenaSegment)) {
       // Arena has been reclaimed, discard this segment.
       globalMetrics.recordDiscarded();
@@ -494,7 +501,9 @@ class ArenaSegmentPool implements AllocatingPool {
           taskHandle.get();
         }
         catch (InterruptedException e) {
-          throw new AssertionError("Pool worker is done", e);
+          Error error = new AssertionError("Pool worker is done");
+          error.initCause(e);
+          throw error;
         }
         catch (ExecutionException e) {
           thrown = e;
