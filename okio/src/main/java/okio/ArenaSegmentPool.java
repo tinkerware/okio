@@ -3,7 +3,9 @@ package okio;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Deque;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -25,6 +27,8 @@ import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 import okio.pool.MetricsRecorder;
 import okio.pool.PoolMetrics;
 import okio.pool.RecorderSet;
+
+import static java.util.Collections.synchronizedList;
 
 /**
  * A segment pool that allocates segments from thread-local arenas.
@@ -374,13 +378,19 @@ class ArenaSegmentPool implements AllocatingPool {
       @Override public void onArena(ArenaRef arena) {
         arena.maybeTrim(lowmark, highmark);
       }
-    }, ArenaCallback.NONE);
+    }, new ArenaCallback() {
+      @Override public void onArena(ArenaRef arena) {
+        globalMetrics.recordReclaimed(arena.metrics());
+      }
+    });
   }
 
   class GlobalMetrics {
     private final AtomicLong discarded = new AtomicLong();
-
     private volatile PoolMetrics baselineMetrics = PoolMetrics.zero();
+
+    // Guarded by this GlobalMetrics instance.
+    private final List<PoolMetrics> previouslyReclaimed = new LinkedList<>();
 
     class CollectingCallback implements ArenaCallback {
 
@@ -397,7 +407,7 @@ class ArenaSegmentPool implements AllocatingPool {
 
     public PoolMetrics aggregate() {
       final Collection<PoolMetrics> aliveArenas = new ArrayList<>();
-      final Collection<PoolMetrics> reclaimedArenas = new ArrayList<>();
+      final Collection<PoolMetrics> reclaimedArenas = resetReclaimed();
 
       ArenaCallback aliveCallback = new CollectingCallback(aliveArenas);
       ArenaCallback reclaimedCallback = new CollectingCallback(reclaimedArenas);
@@ -431,6 +441,16 @@ class ArenaSegmentPool implements AllocatingPool {
 
     long recordDiscarded() {
       return discarded.incrementAndGet();
+    }
+
+    synchronized void recordReclaimed(PoolMetrics snapshot) {
+      previouslyReclaimed.add(snapshot);
+    }
+
+    synchronized List<PoolMetrics> resetReclaimed() {
+      List<PoolMetrics> result = new ArrayList<>(previouslyReclaimed);
+      previouslyReclaimed.clear();
+      return result;
     }
   }
 
