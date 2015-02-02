@@ -22,7 +22,9 @@ import java.util.logging.Logger;
 
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
+import okio.pool.MetricsRecorder;
 import okio.pool.PoolMetrics;
+import okio.pool.RecorderSet;
 
 /**
  * A segment pool that allocates segments from thread-local arenas.
@@ -78,8 +80,9 @@ class ArenaSegmentPool implements AllocatingPool {
 
   private static class ArenaMetrics {
 
-    private final PoolMetrics.Recorder local = new PoolMetrics.Recorder();
-    private final PoolMetrics.Recorder sibling = new PoolMetrics.Recorder();
+    private final RecorderSet recorders = new RecorderSet();
+    private final MetricsRecorder local = recorders.singleWriterRecorder();
+    private final MetricsRecorder siblings = recorders.multiWriterRecorder();
 
     /**
      * The total number of free bytes currently in the arena; never negative.
@@ -108,6 +111,7 @@ class ArenaSegmentPool implements AllocatingPool {
       if (!deallocated) {
         atomicBytes.getAndAdd(this, segmentSize);
       }
+
       local.recordRecycle(segmentSize, deallocated);
     }
 
@@ -115,7 +119,8 @@ class ArenaSegmentPool implements AllocatingPool {
       if (!deallocated) {
         atomicBytes.getAndAdd(this, segmentSize);
       }
-      sibling.recordRecycle(segmentSize, deallocated);
+
+      siblings.recordRecycle(segmentSize, deallocated);
     }
 
     void recordAllocation(int segmentSize) {
@@ -128,7 +133,7 @@ class ArenaSegmentPool implements AllocatingPool {
     }
 
     PoolMetrics snapshot() {
-      return local.snapshot().merge(sibling.snapshot());
+      return recorders.aggregate();
     }
 
     private static final AtomicLongFieldUpdater<ArenaMetrics> atomicBytes =
@@ -405,7 +410,7 @@ class ArenaSegmentPool implements AllocatingPool {
        * We reset the discarded counter to avoid open-ended iteration
        * in a degenerate environment where discarded segments are common.
        */
-      PoolMetrics.Recorder recorder = new PoolMetrics.Recorder();
+      MetricsRecorder recorder = MetricsRecorder.singleWriterRecorder();
       for (long discards = discarded.getAndSet(0); discards > 0; discards--) {
         recorder.recordRecycle(Segment.SIZE, true);
       }

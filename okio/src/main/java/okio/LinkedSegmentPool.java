@@ -15,6 +15,7 @@
  */
 package okio;
 
+import okio.pool.MetricsRecorder;
 import okio.pool.PoolMetrics;
 
 /**
@@ -26,7 +27,7 @@ final class LinkedSegmentPool implements AllocatingPool {
   private Segment next;
 
   /** Recorder for pool metrics. */
-  private final PoolMetrics.Recorder recorder;
+  private final MetricsRecorder recorder;
 
   /**
    * Total bytes in this pool. We still maintain this to provide an exact
@@ -35,7 +36,7 @@ final class LinkedSegmentPool implements AllocatingPool {
   long byteCount;
 
   LinkedSegmentPool() {
-    recorder = new PoolMetrics.Recorder();
+    recorder = MetricsRecorder.multiWriterRecorder();
   }
 
   @Override public Segment take() {
