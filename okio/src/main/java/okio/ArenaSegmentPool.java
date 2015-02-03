@@ -3,7 +3,6 @@ package okio;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.LinkedList;
 import java.util.List;
@@ -27,8 +26,6 @@ import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 import okio.pool.MetricsRecorder;
 import okio.pool.PoolMetrics;
 import okio.pool.RecorderSet;
-
-import static java.util.Collections.synchronizedList;
 
 /**
  * A segment pool that allocates segments from thread-local arenas.
@@ -101,8 +98,16 @@ class ArenaSegmentPool implements AllocatingPool {
     }
 
     Segment recordReusedSegment(Segment segment) {
+      return recordTakenSegment(segment, local);
+    }
+
+    Segment recordStolenSegment(Segment segment) {
+      return recordTakenSegment(segment, siblings);
+    }
+
+    private Segment recordTakenSegment(Segment segment, MetricsRecorder recorder) {
       if (segment != null) {
-        local.recordUse(Segment.SIZE, false);
+        recorder.recordUse(Segment.SIZE, false);
         long updatedArenaSize = atomicBytes.addAndGet(this, -Segment.SIZE);
         assert updatedArenaSize >= 0 : String.format("updatedArenaSize >= 0 : %d, %s",
                                                      updatedArenaSize,
@@ -238,7 +243,7 @@ class ArenaSegmentPool implements AllocatingPool {
      * Called from a sibling's thread.
      */
     private Segment steal() {
-      return metrics.recordReusedSegment(pool.pollLast());
+      return metrics.recordStolenSegment(pool.pollLast());
     }
 
     private ArenaRef randomArena() {

@@ -54,9 +54,9 @@ class ImmutablePoolMetrics extends PoolMetrics {
 
   @Override public boolean equals(Object obj) {
     if (obj == this) return true;
-    if (!(obj instanceof okio.pool.ImmutablePoolMetrics)) return false;
+    if (!(obj instanceof ImmutablePoolMetrics)) return false;
 
-    okio.pool.ImmutablePoolMetrics other = (okio.pool.ImmutablePoolMetrics) obj;
+    ImmutablePoolMetrics other = (ImmutablePoolMetrics) obj;
     return usedByteCount == other.usedByteCount &&
            allocatedByteCount == other.allocatedByteCount &&
            outstandingByteCount == other.outstandingByteCount &&
