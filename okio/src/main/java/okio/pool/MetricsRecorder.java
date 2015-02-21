@@ -57,6 +57,7 @@ public abstract class MetricsRecorder {
     }
 
     @Override public void recordUse(int segmentSize, boolean allocated) {
+      totalTakeCount++;
       if (allocated) {
         allocatedByteCount += segmentSize;
         totalAllocationCount++;
@@ -65,15 +66,14 @@ public abstract class MetricsRecorder {
         usedByteCount -= segmentSize;
       }
       outstandingByteCount += segmentSize;
-      totalTakeCount++;
     }
 
     @Override public void recordRecycle(int segmentSize, boolean deallocated) {
+      totalRecycleCount++;
       if (!deallocated) {
         usedByteCount += segmentSize;
       }
       outstandingByteCount -= segmentSize;
-      totalRecycleCount++;
     }
 
     @Override public void recordTrim(int segmentSize) {
@@ -113,6 +113,7 @@ public abstract class MetricsRecorder {
     }
 
     @Override public void recordUse(int segmentSize, boolean allocated) {
+      atomicTakes.getAndIncrement(this);
       if (allocated) {
         atomicAllocated.getAndAdd(this, segmentSize);
         atomicAllocations.getAndIncrement(this);
@@ -121,15 +122,14 @@ public abstract class MetricsRecorder {
         atomicUsed.getAndAdd(this, -segmentSize);
       }
       atomicOutstanding.getAndAdd(this, segmentSize);
-      atomicTakes.getAndIncrement(this);
     }
 
     @Override public void recordRecycle(int segmentSize, boolean deallocated) {
+      atomicRecycles.getAndIncrement(this);
       if (!deallocated) {
         atomicUsed.getAndAdd(this, segmentSize);
       }
       atomicOutstanding.getAndAdd(this, -segmentSize);
-      atomicRecycles.getAndIncrement(this);
     }
 
     @Override public void recordTrim(int segmentSize) {

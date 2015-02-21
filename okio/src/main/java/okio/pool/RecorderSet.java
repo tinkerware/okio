@@ -2,6 +2,9 @@ package okio.pool;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
@@ -21,11 +24,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * recorder makes progress).
  *
  */
-public class RecorderSet {
+public class RecorderSet implements Iterable<MetricsRecorder> {
 
   class AggregateRecorder extends MetricsRecorder {
 
-    private volatile MetricsRecorder active;
+    private MetricsRecorder active;
     private MetricsRecorder inactive;
     private PoolMetrics aggregated = PoolMetrics.zero();
 
@@ -55,14 +58,14 @@ public class RecorderSet {
     }
 
     @Override public PoolMetrics snapshot() {
-      recordingPhaser.readerLock();
+      snapshotPhaser.readerLock();
       try {
         atomicSwapAndReset();
-        recordingPhaser.flipPhase();
+        flipPhase();
         return aggregate();
       }
       finally {
-        recordingPhaser.readerUnlock();
+        snapshotPhaser.readerUnlock();
       }
     }
 
@@ -75,32 +78,32 @@ public class RecorderSet {
     }
 
     @Override public void recordUse(int segmentSize, boolean allocated) {
-      long phase = recordingPhaser.writerCriticalSectionEnter();
+      long phase = snapshotPhaser.writerCriticalSectionEnter();
       try {
         active.recordUse(segmentSize, allocated);
       }
       finally {
-        recordingPhaser.writerCriticalSectionExit(phase);
+        snapshotPhaser.writerCriticalSectionExit(phase);
       }
     }
 
     @Override public void recordRecycle(int segmentSize, boolean deallocated) {
-      long phase = recordingPhaser.writerCriticalSectionEnter();
+      long phase = snapshotPhaser.writerCriticalSectionEnter();
       try {
         active.recordRecycle(segmentSize, deallocated);
       }
       finally {
-        recordingPhaser.writerCriticalSectionExit(phase);
+        snapshotPhaser.writerCriticalSectionExit(phase);
       }
     }
 
     @Override public void recordTrim(int segmentSize) {
-      long phase = recordingPhaser.writerCriticalSectionEnter();
+      long phase = snapshotPhaser.writerCriticalSectionEnter();
       try {
         active.recordTrim(segmentSize);
       }
       finally {
-        recordingPhaser.writerCriticalSectionExit(phase);
+        snapshotPhaser.writerCriticalSectionExit(phase);
       }
     }
 
@@ -112,7 +115,7 @@ public class RecorderSet {
   }
 
   private final Collection<AggregateRecorder> recorders = new CopyOnWriteArrayList<>();
-  private final WriterReaderPhaser recordingPhaser = new WriterReaderPhaser();
+  private final WriterReaderPhaser snapshotPhaser = new WriterReaderPhaser();
 
   public MetricsRecorder singleWriterRecorder() {
     return createRecorder(new RecorderSource() {
@@ -139,24 +142,67 @@ public class RecorderSet {
   public PoolMetrics aggregate() {
     Collection<PoolMetrics> aggregates = new ArrayList<>(recorders.size());
 
-    recordingPhaser.readerLock();
+    snapshotPhaser.readerLock();
     try {
-      for (AggregateRecorder recorder : recorders) {
-        recorder.atomicSwapAndReset();
-      }
-      flipPhase(recordingPhaser);
-      for (AggregateRecorder recorder : recorders) {
-        aggregates.add(recorder.aggregate());
-      }
+      swapAndCollectInto(recorders, aggregates);
     }
     finally {
-      recordingPhaser.readerUnlock();
+      snapshotPhaser.readerUnlock();
     }
 
     return PoolMetrics.merge(aggregates);
   }
 
-  void flipPhase(WriterReaderPhaser phaser) {
-    phaser.flipPhase();
+  public PoolMetrics remove(Collection<MetricsRecorder> recordersToRemove) {
+    Collection<AggregateRecorder> toRemove = checkedDowncast(recordersToRemove,
+                                                             AggregateRecorder.class);
+    Collection<PoolMetrics> collected = new ArrayList<>(toRemove.size());
+    snapshotPhaser.readerLock();
+    try {
+      if (recorders.removeAll(toRemove)) {
+        swapAndCollectInto(toRemove, collected);
+      }
+    } finally {
+      snapshotPhaser.readerUnlock();
+    }
+    return PoolMetrics.merge(collected);
   }
+
+  void swapAndCollectInto(Iterable<AggregateRecorder> recorders,
+                                  Collection<PoolMetrics> aggregates) {
+    for (AggregateRecorder recorder : recorders) {
+      recorder.atomicSwapAndReset();
+    }
+    flipPhase();
+    for (AggregateRecorder recorder : recorders) {
+      aggregates.add(recorder.aggregate());
+    }
+  }
+
+  void flipPhase() {
+    snapshotPhaser.flipPhase();
+  }
+
+  @SuppressWarnings("unchecked")
+  private <V, U extends V> Collection<U> checkedDowncast(Collection<V> toConvert,
+                                                         Class<U> convertedType) {
+    Collection<V> converted =
+        (Collection<V>) Collections.checkedCollection(new ArrayList<U>(), convertedType);
+    converted.addAll(toConvert);
+    return (Collection<U>) converted;
+  }
+
+  public List<MetricsRecorder> toList() {
+    return new ArrayList<MetricsRecorder>(recorders);
+  }
+
+  @Override public Iterator<MetricsRecorder> iterator() {
+    return capture(recorders.iterator());
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T extends MetricsRecorder> Iterator<MetricsRecorder> capture(Iterator<T> iterator) {
+    return (Iterator<MetricsRecorder>) iterator;
+  }
+
 }

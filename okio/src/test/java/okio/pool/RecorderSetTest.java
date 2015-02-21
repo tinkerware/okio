@@ -1,21 +1,25 @@
 package okio.pool;
 
+import java.util.Collection;
+import java.util.Random;
 import java.util.concurrent.Phaser;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
 
 public class RecorderSetTest {
 
-  static final int MAX_ITERATIONS = 10000;
+  static final int MAX_ITERATIONS = 5000;
   static final int MAX_TASKS = Runtime.getRuntime().availableProcessors() - 1;
 
   /*
-   * By consistency, we mean that a reader will observe all changes to the
-   * metrics atomically. Writers are spawned as individual threads and the
-   * main thread acts as the single reader.
+   * By atomicity, we mean that a reader will observe all changes to the
+   * metrics completely or not at all. Writers are spawned as individual
+   * threads and the main thread acts as the single reader.
    *
    * The main body of the test executes `MAX_ITERATIONS` times. At each iteration,
    * we bring the writers to a sync point. At each such point, we capture a
@@ -33,37 +37,35 @@ public class RecorderSetTest {
    */
 
   @Test(timeout = 30000)
-  public void snapshotsAreConsistent() throws InterruptedException {
+  public void snapshotsAreAtomic() throws InterruptedException {
     final Phaser loop = new Phaser() {
       @Override protected boolean onAdvance(int phase, int registeredParties) {
         return phase >= MAX_ITERATIONS || registeredParties == 0;
       }
     };
-    final AtomicInteger countdownToGo = new AtomicInteger(MAX_TASKS + 1);
 
+    final AtomicBoolean ready = new AtomicBoolean();
     class RecordMetrics implements Runnable {
 
       final MetricsDriver driver;
 
       RecordMetrics(MetricsRecorder recorder) {
-        this.driver = new MetricsDriver(recorder);
+        this.driver = new MetricsDriver(recorder, ready);
       }
 
       @Override public void run() {
         while (!loop.isTerminated()) {
+          // We wait for other other recorders to arrive at
+          // sync point, then release simultaneously.
           loop.arriveAndAwaitAdvance();
-          while (countdownToGo.get() > 0) {
-            // We spin while other tasks are being unparked so that all
-            // tasks can start recording as concurrently as we can make it.
-          }
-          driver.applyAlternate(1);
+          driver.performIteration(1000 * 1000);
         }
       }
     }
 
-    RecorderSet recorders = new RecorderSet();
-    RecordMetrics[] tasks = new RecordMetrics[MAX_TASKS];
-    loop.bulkRegister(tasks.length);
+    final RecorderSet recorders = new RecorderSet();
+    final RecordMetrics[] tasks = new RecordMetrics[MAX_TASKS];
+    loop.bulkRegister(tasks.length + 1);
     for (int i = 0; i < tasks.length; i++) {
       tasks[i] = new RecordMetrics(recorders.singleWriterRecorder());
       Thread thread = new Thread(tasks[i], "Record Metrics - " + (i + 1));
@@ -71,13 +73,16 @@ public class RecorderSetTest {
     }
 
     do {
-      int phase = loop.register();
+      // Ready...
+      ready.set(true);
       while (loop.getUnarrivedParties() > 1) {
         // We spin for a little bit while tasks stop at sync point.
       }
 
-      PoolMetrics baseline = recorders.aggregate();
 
+      int phase = loop.getPhase();
+      PoolMetrics baseline = recorders.aggregate();
+      // Set...
       long baselineTakes = 0;
       long baselineRecycles = 0;
       for (RecordMetrics task : tasks) {
@@ -85,31 +90,18 @@ public class RecorderSetTest {
         baselineRecycles += task.driver.recycleCount;
       }
 
-      // Order is important here; we set the countdown
-      // for the race before we let the writers observe
-      // its value.
-      countdownToGo.set(MAX_TASKS + 1);
-      if (loop.arriveAndDeregister() < 0) {
-        // We may be arriving after the phaser terminated the loop
-        // once it went over the maximum iteration count; bail out
-        // before hitting the busy spin in that case; there's no one
-        // at the other end, which would cause an endless loop.
-        break;
-      }
-      // The busy wait aligns the writer and reader threads as
-      // closely as we can make it so that we get a good race.
-      countdownToGo.getAndDecrement();
-      while (countdownToGo.get() > 0) {
-        // ready, set, go!
-      }
+      // Go!
+      ready.set(false);
+      loop.arrive();
+      Thread.yield();
 
       PoolMetrics current = recorders.aggregate();
 
-      MetricsDriver delta = new MetricsDriver(MetricsRecorder.singleWriterRecorder(), baseline);
-      delta.applyUse(current.totalTakeCount() - baselineTakes);
-      delta.applyRecycle(current.totalRecycleCount() - baselineRecycles);
+      MetricsDriver updated = new MetricsDriver(MetricsRecorder.singleWriterRecorder(), baseline);
+      updated.applyUse(current.totalTakeCount() - baselineTakes);
+      updated.applyRecycle(current.totalRecycleCount() - baselineRecycles);
 
-      assertEquals("baseline + delta: " + phase, current, delta.recorder.snapshot());
+      assertEquals("baseline <> updated: iteration " + phase, current, updated.recorder.snapshot());
     }
     while (!loop.isTerminated());
 
@@ -117,25 +109,31 @@ public class RecorderSetTest {
 
   private static class MetricsDriver {
 
-    private MetricsRecorder recorder;
+    private final Random random = new Random();
+    private final MetricsRecorder recorder;
+    private final AtomicBoolean ready;
     private long takeCount;
     private long recycleCount;
-    private boolean recycle;
 
-    MetricsDriver(MetricsRecorder recorder) {
-      this(recorder, PoolMetrics.zero());
+    MetricsDriver(MetricsRecorder recorder, AtomicBoolean ready) {
+      this(recorder, PoolMetrics.zero(), ready);
     }
 
     MetricsDriver(MetricsRecorder recorder, PoolMetrics initial) {
+      this(recorder, initial, new AtomicBoolean());
+    }
+
+    MetricsDriver(MetricsRecorder recorder, PoolMetrics initial, AtomicBoolean ready) {
       this.recorder = recorder;
+      this.ready = ready;
       if (!initial.equals(PoolMetrics.zero())) {
         recorder.reset(initial);
       }
     }
 
-    void applyAlternate(int delta) {
-      for (int i = 0; i < delta; i++) {
-        if (recycle) {
+    void performIteration(int delta) {
+      for (int i = 0; i < delta && !ready.get(); i++) {
+        if (random.nextBoolean()) {
           recorder.recordRecycle(1, true);
           recycleCount++;
         }
@@ -143,11 +141,11 @@ public class RecorderSetTest {
           recorder.recordUse(1, true);
           takeCount++;
         }
-        recycle ^= true;
       }
     }
 
     void applyUse(long delta) {
+      assertTrue("use delta negative: " + delta, delta >= 0);
       for (int i = 0; i < delta; i++) {
         recorder.recordUse(1, true);
       }
@@ -155,10 +153,12 @@ public class RecorderSetTest {
     }
 
     void applyRecycle(long delta) {
+      assertTrue("recycle delta negative: " + delta, delta >= 0);
       for (int i = 0; i < delta; i++) {
         recorder.recordRecycle(1, true);
       }
       recycleCount += delta;
     }
   }
+
 }
