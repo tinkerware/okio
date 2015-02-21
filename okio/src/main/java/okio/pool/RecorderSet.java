@@ -28,7 +28,7 @@ public class RecorderSet implements Iterable<MetricsRecorder> {
 
   class AggregateRecorder extends MetricsRecorder {
 
-    private MetricsRecorder active;
+    private volatile MetricsRecorder active;
     private MetricsRecorder inactive;
     private PoolMetrics aggregated = PoolMetrics.zero();
 

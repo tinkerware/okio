@@ -25,7 +25,7 @@ public class RecorderSetTest {
    * we bring the writers to a sync point. At each such point, we capture a
    * baseline snapshot and record "witness" counters with which we can later
    * reproduce the actions of all writers. Afterwards, we bring the writers
-   * out of the safe point carefully so that they race against the reader
+   * out of the sync point carefully so that they race against the reader
    * thread while it captures a second, final snapshot.
    *
    * Given the final snapshot and the witness counters, we now (re)construct
@@ -45,103 +45,101 @@ public class RecorderSetTest {
     };
 
     final AtomicBoolean ready = new AtomicBoolean();
+
     class RecordMetrics implements Runnable {
-
-      final MetricsDriver driver;
-
-      RecordMetrics(MetricsRecorder recorder) {
-        this.driver = new MetricsDriver(recorder, ready);
-      }
+      final Random random = new Random();
+      volatile MetricsDelta delta;
 
       @Override public void run() {
         while (!loop.isTerminated()) {
           // We wait for other other recorders to arrive at
           // sync point, then release simultaneously.
           loop.arriveAndAwaitAdvance();
-          driver.performIteration(1000 * 1000);
+          performIteration(1000 * 1000);
+        }
+      }
+
+      void performIteration(int count) {
+        MetricsDelta delta = this.delta;
+        for (int i = 0; i < count && !ready.get(); i++) {
+          if (random.nextBoolean()) {
+            delta.applyUse(1);
+          }
+          else {
+            delta.applyRecycle(1);
+          }
         }
       }
     }
 
-    final RecorderSet recorders = new RecorderSet();
     final RecordMetrics[] tasks = new RecordMetrics[MAX_TASKS];
     loop.bulkRegister(tasks.length + 1);
     for (int i = 0; i < tasks.length; i++) {
-      tasks[i] = new RecordMetrics(recorders.singleWriterRecorder());
+      tasks[i] = new RecordMetrics();
       Thread thread = new Thread(tasks[i], "Record Metrics - " + (i + 1));
       thread.start();
     }
 
+    PoolMetrics baseline = PoolMetrics.zero();
     do {
+
       // Ready...
       ready.set(true);
       while (loop.getUnarrivedParties() > 1) {
         // We spin for a little bit while tasks stop at sync point.
       }
-
-
       int phase = loop.getPhase();
-      PoolMetrics baseline = recorders.aggregate();
+
       // Set...
-      long baselineTakes = 0;
-      long baselineRecycles = 0;
+      final RecorderSet recorders = new RecorderSet();
+      long finalTakes = 0;
+      long finalRecycles = 0;
       for (RecordMetrics task : tasks) {
-        baselineTakes += task.driver.takeCount;
-        baselineRecycles += task.driver.recycleCount;
+        if (task.delta != null) {
+          // We know that delta counts are most recent since
+          // the workers arrive at sync point (after their last
+          // write to recorders' counters) before we observe them
+          // doing so in the busy spin above.
+          finalTakes += task.delta.takeCount;
+          finalRecycles += task.delta.recycleCount;
+        }
+        task.delta = new MetricsDelta(recorders.singleWriterRecorder());
       }
+
+      MetricsDelta updated = new MetricsDelta();
+      updated.applyUse(finalTakes - baseline.totalTakeCount());
+      updated.applyRecycle(finalRecycles - baseline.totalRecycleCount());
+      PoolMetrics actual = baseline.merge(updated.recorder.snapshot());
+
+      MetricsDelta total = new MetricsDelta();
+      total.applyUse(finalTakes);
+      total.applyRecycle(finalRecycles);
+      PoolMetrics expected = total.recorder.snapshot();
+
+      assertEquals("total <> (last + delta): iteration " + phase, expected, actual);
 
       // Go!
       ready.set(false);
       loop.arrive();
       Thread.yield();
 
-      PoolMetrics current = recorders.aggregate();
-
-      MetricsDriver updated = new MetricsDriver(MetricsRecorder.singleWriterRecorder(), baseline);
-      updated.applyUse(current.totalTakeCount() - baselineTakes);
-      updated.applyRecycle(current.totalRecycleCount() - baselineRecycles);
-
-      assertEquals("baseline <> updated: iteration " + phase, current, updated.recorder.snapshot());
+      baseline = recorders.aggregate();
     }
     while (!loop.isTerminated());
 
   }
 
-  private static class MetricsDriver {
-
-    private final Random random = new Random();
+  private static class MetricsDelta {
     private final MetricsRecorder recorder;
-    private final AtomicBoolean ready;
     private long takeCount;
     private long recycleCount;
 
-    MetricsDriver(MetricsRecorder recorder, AtomicBoolean ready) {
-      this(recorder, PoolMetrics.zero(), ready);
+    MetricsDelta() {
+      this(MetricsRecorder.singleWriterRecorder());
     }
 
-    MetricsDriver(MetricsRecorder recorder, PoolMetrics initial) {
-      this(recorder, initial, new AtomicBoolean());
-    }
-
-    MetricsDriver(MetricsRecorder recorder, PoolMetrics initial, AtomicBoolean ready) {
+    MetricsDelta(MetricsRecorder recorder) {
       this.recorder = recorder;
-      this.ready = ready;
-      if (!initial.equals(PoolMetrics.zero())) {
-        recorder.reset(initial);
-      }
-    }
-
-    void performIteration(int delta) {
-      for (int i = 0; i < delta && !ready.get(); i++) {
-        if (random.nextBoolean()) {
-          recorder.recordRecycle(1, true);
-          recycleCount++;
-        }
-        else {
-          recorder.recordUse(1, true);
-          takeCount++;
-        }
-      }
     }
 
     void applyUse(long delta) {
@@ -160,5 +158,4 @@ public class RecorderSetTest {
       recycleCount += delta;
     }
   }
-
 }
