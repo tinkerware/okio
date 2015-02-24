@@ -39,6 +39,30 @@ public abstract class PoolMetrics {
                                     totalRecycleCount() + other.totalRecycleCount());
   }
 
+  @Override public boolean equals(Object obj) {
+    if (obj == this) return true;
+    if (!(obj instanceof PoolMetrics)) return false;
+
+    PoolMetrics other = (PoolMetrics) obj;
+    return usedByteCount() == other.usedByteCount() &&
+           allocatedByteCount() == other.allocatedByteCount() &&
+           outstandingByteCount() == other.outstandingByteCount() &&
+           totalAllocationCount() == other.totalAllocationCount() &&
+           totalTakeCount() == other.totalTakeCount() &&
+           totalRecycleCount() == other.totalRecycleCount();
+  }
+
+  @Override public int hashCode() {
+    int result = 17;
+    result = 31 * result + (int) (usedByteCount() ^ (usedByteCount() >>> 32));
+    result = 31 * result + (int) (allocatedByteCount() ^ (allocatedByteCount() >>> 32));
+    result = 31 * result + (int) (outstandingByteCount() ^ (outstandingByteCount() >>> 32));
+    result = 31 * result + (int) (totalAllocationCount() ^ (totalAllocationCount() >>> 32));
+    result = 31 * result + (int) (totalTakeCount() ^ (totalTakeCount() >>> 32));
+    result = 31 * result + (int) (totalRecycleCount() ^ (totalRecycleCount() >>> 32));
+    return result;
+  }
+
   @Override public String toString() {
     return String.format("PoolMetrics{used=%d allocated=%d outstanding=%d allocations=%d takes=%d recycles=%d}",
                          usedByteCount(),
@@ -48,5 +72,4 @@ public abstract class PoolMetrics {
                          totalTakeCount(),
                          totalRecycleCount());
   }
-
 }
