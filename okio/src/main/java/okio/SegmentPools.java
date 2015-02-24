@@ -34,7 +34,7 @@ public class SegmentPools {
   }
 
   private static SegmentPool concurrentPool() throws Exception {
-    return (SegmentPool) create(Class.forName("okio.ArenaSegmentPool"));
+    return (SegmentPool) create(Class.forName("okio.FramedSegmentPool"));
   }
 
   private static <T> T create(Class<T> poolType) throws Exception {
